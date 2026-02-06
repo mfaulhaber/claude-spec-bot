@@ -1,0 +1,29 @@
+# Secrets — never commit
+runner/.env
+
+# Runner ephemeral outputs
+runner/logs/
+runner/artifacts/
+runner/venv/
+runner/jobs/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

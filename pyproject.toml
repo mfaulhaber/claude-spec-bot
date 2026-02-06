@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poc"
+version = "0.1.0"
+description = "Python POC with containerized build/test and LLM provider abstraction"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+orchestrator = [
+    "slack-bolt>=1.18",
+    "slack-sdk>=3.27",
+]
+
+[project.scripts]
+poc = "poc.cli:main"
+poc-orchestrator = "orchestrator_host.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["poc*", "orchestrator_host*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: marks tests that require network access (deselect with '-m \"not network\"')",
+]

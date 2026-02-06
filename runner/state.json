@@ -1,0 +1,20 @@
+{
+  "job_id": "local-poc",
+  "goal": "Python POC (local Mac) with containerized build/test, LLM provider abstraction, and Slack-controlled orchestrator.",
+  "phase": "DONE",
+  "repo": { "branch": "main", "commit": "b4f9de2" },
+  "env": {
+    "python": "3.12",
+    "ollama_base_url": "http://host.docker.internal:11434",
+    "secrets_needed": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"]
+  },
+  "processes": [],
+  "outputs": {
+    "endpoints": [],
+    "artifacts": ["runner/artifacts/test-report.md"],
+    "test_report": "63 passed, 3 skipped (network tests — no keys/opt-in)"
+  },
+  "blockers": [],
+  "next_actions": ["Set SLACK_BOT_TOKEN and SLACK_APP_TOKEN, then run: python -m orchestrator_host.main"],
+  "last_update": "2026-02-06T00:00:00Z"
+}
