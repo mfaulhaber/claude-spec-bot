@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import signal
 import subprocess
+import urllib.request
 from dataclasses import dataclass
 
 from orchestrator_host.state import job_logs_dir
 
 log = logging.getLogger(__name__)
+
+RUNNER_URL = "http://localhost:8000"
 
 
 @dataclass
@@ -97,6 +101,26 @@ def cancel_job_container(job_id: str, step_id: str) -> None:
             )
         except (subprocess.TimeoutExpired, FileNotFoundError):
             log.error("Failed to kill container %s", name)
+
+
+def send_message_to_runner(job_id: str, message: str, *, timeout: int = 30) -> dict:
+    """Send a message to the runner's HTTP handler and return the response."""
+    payload = json.dumps({"job_id": job_id, "message": message}).encode()
+    req = urllib.request.Request(
+        RUNNER_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    log.info("Sending message to runner for job %s: %s", job_id, message)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+            log.info("Runner response for job %s: %s", job_id, data.get("reply", ""))
+            return data
+    except Exception:
+        log.exception("Failed to send message to runner for job %s", job_id)
+        return {"error": "Runner unreachable", "job_id": job_id, "status": "failed"}
 
 
 def cancel_subprocess(proc: subprocess.Popen, job_id: str, step_id: str) -> None:

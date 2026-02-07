@@ -6,6 +6,13 @@ import logging
 import os
 import shutil
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load orchestrator .env from the same directory as this file
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(_env_path)
 
 log = logging.getLogger(__name__)
 
@@ -42,9 +49,11 @@ def check_prerequisites() -> list[str]:
 def main() -> None:
     """Run the orchestrator."""
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
+    logging.getLogger("slack_bolt").setLevel(logging.INFO)
+    logging.getLogger("slack_sdk").setLevel(logging.INFO)
 
     log.info("POC Orchestrator starting...")
 

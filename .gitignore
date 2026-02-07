@@ -1,5 +1,6 @@
 # Secrets — never commit
 runner/.env
+orchestrator_host/.env
 
 # Runner ephemeral outputs
 runner/logs/

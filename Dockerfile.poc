@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Runner state dir is mounted at /runner
+RUN mkdir -p /runner/logs /runner/artifacts /runner/jobs
+
+EXPOSE 8000
+
+CMD ["python", "-m", "poc.handler"]

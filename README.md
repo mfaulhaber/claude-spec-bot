@@ -59,30 +59,80 @@ docker compose run --rm runner bash -lc "scripts/run.sh llm --backend anthropic 
 
 ## Slack Orchestrator
 
-The orchestrator runs on your host machine and connects to Slack via Socket Mode.
+The orchestrator runs on your host machine and connects to Slack via Socket Mode (no public URL needed).
 
-### Setup
+### 1. Create a Slack App
 
-1. Create a Slack app with Socket Mode enabled and the following scopes:
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App** > **From scratch**.
+2. Name it (e.g. `POC Bot`), select your workspace, and click **Create App**.
+
+### 2. Generate an App-Level Token (`SLACK_APP_TOKEN`)
+
+1. In the left sidebar: **Settings > Basic Information**.
+2. Scroll to **App-Level Tokens** and click **Generate Token and Scopes**.
+3. Name it (e.g. `socket-token`), add the scope `connections:write`, and click **Generate**.
+4. Copy the `xapp-...` value.
+
+### 3. Enable Socket Mode
+
+1. Left sidebar: **Settings > Socket Mode**.
+2. Toggle **Enable Socket Mode** to **On**.
+
+### 4. Subscribe to Events
+
+1. Left sidebar: **Features > Event Subscriptions**.
+2. Toggle **Enable Events** to **On**.
+3. Under **Subscribe to bot events**, add:
+   - `message.channels` (public channels)
+   - `message.groups` (private channels, optional)
+4. Click **Save Changes**.
+
+### 5. Add Bot Permissions
+
+1. Left sidebar: **Features > OAuth & Permissions**.
+2. Under **Bot Token Scopes**, add:
    - `chat:write`
    - `channels:history` (or `groups:history` for private channels)
    - `app_mentions:read`
 
-2. Install the orchestrator dependencies:
-   ```bash
-   pip install -e ".[orchestrator]"
-   ```
+### 6. Install the App and Get the Bot Token (`SLACK_BOT_TOKEN`)
 
-3. Export your Slack tokens:
-   ```bash
-   export SLACK_BOT_TOKEN=xoxb-...
-   export SLACK_APP_TOKEN=xapp-...
-   ```
+1. Left sidebar: **Settings > Install App**.
+2. Click **Install to Workspace** and authorize.
+3. Copy the **Bot User OAuth Token** (`xoxb-...`).
 
-4. Start the orchestrator:
-   ```bash
-   python -m orchestrator_host.main
-   ```
+### 7. Configure Tokens
+
+Copy the example env file and fill in both tokens:
+
+```bash
+cp orchestrator_host/.env.example orchestrator_host/.env
+```
+
+```
+# orchestrator_host/.env
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_APP_TOKEN=xapp-your-app-token
+```
+
+### 8. Create a Slack Channel
+
+1. In Slack, create a channel for the bot (e.g. `#poc-bot`).
+2. Invite the bot to the channel: `/invite @POC Bot`.
+
+### 9. Install and Run
+
+```bash
+# Create a local venv and install
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[orchestrator]"
+
+# Start the orchestrator
+python -m orchestrator_host.main
+```
+
+Verify by typing `!poc help` in the channel — the bot should respond.
 
 ### Slack Commands
 

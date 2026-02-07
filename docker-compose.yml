@@ -1,0 +1,18 @@
+services:
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.poc
+    volumes:
+      - .:/workspace
+      - ./runner:/runner
+    env_file:
+      - runner/.env
+    environment:
+      - PYTHONPATH=/workspace/src
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
+    working_dir: /workspace

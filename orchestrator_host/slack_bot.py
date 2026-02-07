@@ -161,10 +161,12 @@ def create_slack_app(queue: JobQueue):
     @app.message(re.compile(r"^!poc\b", re.IGNORECASE))
     def handle_poc_command(message, say, client):
         text = message.get("text", "")
-        action, args = parse_command(text)
-        channel = message["channel"]
         user = message.get("user", "unknown")
+        channel = message["channel"]
         thread_ts = message.get("ts", "")
+        log.debug("Matched !poc command: user=%s channel=%s text=%r", user, channel, text)
+        action, args = parse_command(text)
+        log.debug("Parsed command: action=%r args=%r", action, args)
 
         if action == "help" or action == "":
             say(text=HELP_TEXT, thread_ts=thread_ts)
@@ -179,16 +181,15 @@ def create_slack_app(queue: JobQueue):
             save_state(state)
 
             say(
-                text=f":rocket: Job `{state.job_id}` queued: _{goal}_",
+                text=f":rocket: Job `{state.job_id}` sending to runner: _{goal}_",
                 thread_ts=thread_ts,
             )
 
-            position = queue.enqueue(state.job_id)
-            if position > 0:
-                say(
-                    text=f":hourglass: Queue position: {position}",
-                    thread_ts=thread_ts,
-                )
+            from orchestrator_host.docker_exec import send_message_to_runner
+
+            response = send_message_to_runner(state.job_id, goal)
+            reply = response.get("reply", response.get("error", "No response from runner"))
+            say(text=reply, thread_ts=thread_ts)
 
         elif action == "status":
             job_id = args.strip() if args.strip() else queue.current_job_id
@@ -232,6 +233,14 @@ def create_slack_app(queue: JobQueue):
                 text=f":question: Unknown command `{action}`. Try `!poc help`.",
                 thread_ts=thread_ts,
             )
+
+    @app.event("message")
+    def handle_other_messages(event):
+        """Acknowledge non-!poc messages so Bolt doesn't log warnings."""
+        text = event.get("text", "")
+        user = event.get("user", "unknown")
+        channel = event.get("channel", "unknown")
+        log.debug("Ignored message: user=%s channel=%s text=%r", user, channel, text)
 
     return app
 
