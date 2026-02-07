@@ -1,4 +1,4 @@
-"""Slack bot: command parsing, handlers, and SlackCallback for pipeline progress."""
+"""Slack bot: command parsing, handlers, and progress callbacks for agent mode."""
 
 from __future__ import annotations
 
@@ -6,8 +6,11 @@ import logging
 import re
 from typing import Any
 
-from orchestrator_host.jobs import JobQueue, PipelineCallback
-from orchestrator_host.state import JobState, StepState, create_job, list_jobs, load_state
+from orchestrator_host.approvals import ApprovalManager
+from orchestrator_host.docker_exec import send_message
+from orchestrator_host.jobs import AgentCallback, JobQueue
+from orchestrator_host.progress import SlackProgressReporter
+from orchestrator_host.state import JobState, create_job, list_jobs, load_state, save_state
 
 log = logging.getLogger(__name__)
 
@@ -40,60 +43,59 @@ def parse_command(text: str) -> tuple[str, str]:
     return (action, args)
 
 
+def _parse_model_flag(args: str) -> tuple[str, str]:
+    """Extract --model flag from args. Returns (model, remaining_args)."""
+    model_map = {
+        "opus": "claude-opus-4-20250514",
+        "sonnet": "claude-sonnet-4-5-20250929",
+        "haiku": "claude-haiku-4-5-20251001",
+    }
+    match = re.match(r"--model\s+(\S+)\s*(.*)", args, re.DOTALL)
+    if match:
+        model_key = match.group(1).lower()
+        remaining = match.group(2).strip()
+        model = model_map.get(model_key, model_key)
+        return model, remaining
+    return "", args
+
+
 # --- Help text ---
 
 HELP_TEXT = """\
-*POC Orchestrator Commands*
+*POC Agent Commands*
 
-`!poc run <goal>` — Start a new pipeline run with the given goal
-`!poc status [job_id]` — Show status of a job (or current job)
-`!poc cancel [job_id]` — Cancel a running or queued job
+`!poc run [--model opus|sonnet] <task>` — Start the agent with a task
+`!poc status [job_id]` — Show agent status
+`!poc cancel [job_id]` — Cancel a running agent
 `!poc list` — List recent jobs
 `!poc help` — Show this help message
+
+The agent will request approval for bash commands and file writes.
+Reply "yes"/"approve" or "no"/"deny" in the thread, or use the buttons.
 """
 
 
-# --- SlackCallback (PipelineCallback implementation) ---
+# --- SlackCallback (AgentCallback implementation) ---
 
 
-class SlackCallback(PipelineCallback):
-    """Reports pipeline progress to Slack threads."""
+class SlackCallback(AgentCallback):
+    """Reports agent lifecycle events to Slack threads."""
 
     def __init__(self, client: Any):
         self.client = client
 
-    def on_step_start(self, state: JobState, step: StepState) -> None:
-        self._post(state, f":arrow_forward: Starting step `{step.id}`: `{step.command}`")
-
-    def on_step_done(self, state: JobState, step: StepState) -> None:
-        if step.status == "done":
-            self._post(state, f":white_check_mark: Step `{step.id}` passed (exit 0)")
-        else:
-            self._post(
-                state,
-                f":x: Step `{step.id}` failed (exit {step.exit_code})",
-            )
+    def on_job_started(self, state: JobState) -> None:
+        self._post(state, f":robot_face: Agent started (model: `{state.model}`)")
 
     def on_job_done(self, state: JobState) -> None:
-        self._post(state, ":tada: All pipeline steps passed!")
+        self._post(state, ":white_check_mark: Agent completed!")
 
-    def on_job_failed(self, state: JobState, step: StepState) -> None:
-        self._post(
-            state,
-            f":rotating_light: Pipeline failed at step `{step.id}` "
-            f"(exit {step.exit_code}). "
-            f"Check logs: `runner/jobs/{state.job_id}/logs/{step.id}.log`",
-        )
-
-    def on_job_blocked(self, state: JobState, blockers: list[str]) -> None:
-        blocker_text = "\n".join(f"• {b}" for b in blockers)
-        self._post(
-            state,
-            f":warning: Pipeline is *BLOCKED*:\n{blocker_text}",
-        )
+    def on_job_failed(self, state: JobState) -> None:
+        error = state.error or "Unknown error"
+        self._post(state, f":x: Agent failed: {error}")
 
     def on_job_cancelled(self, state: JobState) -> None:
-        self._post(state, ":stop_sign: Pipeline cancelled.")
+        self._post(state, ":stop_sign: Agent cancelled.")
 
     def _post(self, state: JobState, text: str) -> None:
         if not state.channel_id or not state.thread_ts:
@@ -117,7 +119,8 @@ def format_job_status(state: JobState) -> str:
     phase_emoji = {
         "QUEUED": ":hourglass:",
         "RUNNING": ":gear:",
-        "DONE": ":tada:",
+        "WAITING_APPROVAL": ":lock:",
+        "DONE": ":white_check_mark:",
         "FAILED": ":x:",
         "CANCELLED": ":stop_sign:",
         "BLOCKED": ":warning:",
@@ -127,18 +130,15 @@ def format_job_status(state: JobState) -> str:
     lines = [
         f"{emoji} *Job {state.job_id}* — {state.phase}",
         f"Goal: _{state.goal}_",
+        f"Model: `{state.model}`",
+        f"Iteration: {state.agent_iteration}/{state.max_iterations}",
     ]
 
-    for step in state.steps:
-        step_emoji = {
-            "pending": ":white_circle:",
-            "running": ":blue_circle:",
-            "done": ":white_check_mark:",
-            "failed": ":x:",
-            "skipped": ":fast_forward:",
-        }.get(step.status, ":question:")
-        exit_info = f" (exit {step.exit_code})" if step.exit_code is not None else ""
-        lines.append(f"  {step_emoji} `{step.id}`: {step.status}{exit_info}")
+    if state.input_tokens or state.output_tokens:
+        lines.append(f"Tokens: {state.input_tokens:,} in / {state.output_tokens:,} out")
+
+    if state.approved_tools:
+        lines.append(f"Approved tools: {', '.join(state.approved_tools)}")
 
     if state.error:
         lines.append(f"\n:rotating_light: Error: {state.error}")
@@ -149,7 +149,11 @@ def format_job_status(state: JobState) -> str:
 # --- Slack app factory ---
 
 
-def create_slack_app(queue: JobQueue):
+def create_slack_app(
+    queue: JobQueue,
+    progress_reporter: SlackProgressReporter | None = None,
+    approval_manager: ApprovalManager | None = None,
+):
     """Create and configure the Slack Bolt app with !poc command handlers.
 
     Requires slack_bolt to be installed (orchestrator extra).
@@ -157,6 +161,9 @@ def create_slack_app(queue: JobQueue):
     from slack_bolt import App
 
     app = App(token=_get_env("SLACK_BOT_TOKEN"))
+
+    # Track job_id -> thread_ts mapping for text reply handling
+    _job_threads: dict[str, str] = {}  # thread_ts -> job_id
 
     @app.message(re.compile(r"^!poc\b", re.IGNORECASE))
     def handle_poc_command(message, say, client):
@@ -172,24 +179,30 @@ def create_slack_app(queue: JobQueue):
             say(text=HELP_TEXT, thread_ts=thread_ts)
 
         elif action == "run":
-            goal = args or "Run default pipeline"
-            state = create_job(goal=goal, requested_by=user, channel_id=channel)
+            model, goal = _parse_model_flag(args)
+            goal = goal or "Complete the task"
+
+            state = create_job(
+                goal=goal, requested_by=user, channel_id=channel,
+                model=model or "claude-sonnet-4-5-20250929",
+            )
             state.thread_ts = thread_ts
             state.original_message_ts = thread_ts
-            from orchestrator_host.state import save_state
-
             save_state(state)
 
+            # Register with progress reporter
+            if progress_reporter:
+                progress_reporter.register_job(state.job_id, channel, thread_ts)
+
+            # Track thread for text replies
+            _job_threads[thread_ts] = state.job_id
+
             say(
-                text=f":rocket: Job `{state.job_id}` sending to runner: _{goal}_",
+                text=f":rocket: Job `{state.job_id}` started: _{goal}_\nModel: `{state.model}`",
                 thread_ts=thread_ts,
             )
 
-            from orchestrator_host.docker_exec import send_message_to_runner
-
-            response = send_message_to_runner(state.job_id, goal)
-            reply = response.get("reply", response.get("error", "No response from runner"))
-            say(text=reply, thread_ts=thread_ts)
+            queue.enqueue(state.job_id)
 
         elif action == "status":
             job_id = args.strip() if args.strip() else queue.current_job_id
@@ -234,13 +247,63 @@ def create_slack_app(queue: JobQueue):
                 thread_ts=thread_ts,
             )
 
+    # --- Interactive action handlers (Block Kit buttons) ---
+
+    @app.action("approve_tool")
+    def handle_approve(ack, body, client):
+        ack()
+        value = body["actions"][0]["value"]
+        job_id, tool_use_id, tool_name = value.split("|", 2)
+        message_ts = body.get("container", {}).get("message_ts", "")
+        if approval_manager:
+            approval_manager.handle_approve(job_id, tool_use_id, message_ts=message_ts)
+
+    @app.action("approve_tool_all")
+    def handle_approve_all(ack, body, client):
+        ack()
+        value = body["actions"][0]["value"]
+        job_id, tool_use_id, tool_name = value.split("|", 2)
+        message_ts = body.get("container", {}).get("message_ts", "")
+        if approval_manager:
+            approval_manager.handle_approve(
+                job_id, tool_use_id, auto_all=True, message_ts=message_ts,
+            )
+
+    @app.action("deny_tool")
+    def handle_deny(ack, body, client):
+        ack()
+        value = body["actions"][0]["value"]
+        job_id, tool_use_id, tool_name = value.split("|", 2)
+        message_ts = body.get("container", {}).get("message_ts", "")
+        if approval_manager:
+            approval_manager.handle_deny(job_id, tool_use_id, message_ts=message_ts)
+
+    # --- Thread reply handler ---
+
     @app.event("message")
-    def handle_other_messages(event):
-        """Acknowledge non-!poc messages so Bolt doesn't log warnings."""
+    def handle_other_messages(event, client):
+        """Handle thread replies: approval text or follow-up instructions."""
         text = event.get("text", "")
-        user = event.get("user", "unknown")
-        channel = event.get("channel", "unknown")
-        log.debug("Ignored message: user=%s channel=%s text=%r", user, channel, text)
+        thread_ts = event.get("thread_ts")
+
+        if not thread_ts or not text:
+            return
+
+        # Check if this thread is associated with a job
+        job_id = _job_threads.get(thread_ts)
+        if not job_id:
+            return
+
+        # Skip if it's a !poc command (handled above)
+        if text.strip().lower().startswith("!poc"):
+            return
+
+        # Try as approval text reply
+        if approval_manager and approval_manager.handle_text_reply(job_id, text):
+            return
+
+        # Otherwise, forward as a follow-up message to the agent
+        send_message(job_id, text)
 
     return app
 

@@ -11,6 +11,7 @@ services:
     environment:
       - PYTHONPATH=/workspace/src
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - ORCHESTRATOR_CALLBACK_URL=http://host.docker.internal:8001/events
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

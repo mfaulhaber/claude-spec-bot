@@ -71,16 +71,70 @@ def main() -> None:
     if recovered:
         log.warning("Recovered %d stale jobs: %s", len(recovered), recovered)
 
-    # Create Slack app with callback
+    # Create Slack app with all components wired together
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+    from orchestrator_host.approvals import ApprovalManager
+    from orchestrator_host.callback_server import start_callback_server
+    from orchestrator_host.progress import SlackProgressReporter
     from orchestrator_host.slack_bot import SlackCallback, create_slack_app
 
-    # Build the queue with Slack callback wired in after app creation
+    # Build queue with null callback (will be replaced after app creation)
     queue = JobQueue()
-    slack_app = create_slack_app(queue)
 
-    # Wire up the callback with the Slack client
+    # We need the Slack client first — create a temporary app to get it
+    # Then rebuild with all components wired
+    from slack_bolt import App
+
+    temp_app = App(token=os.environ["SLACK_BOT_TOKEN"])
+    slack_client = temp_app.client
+
+    # Create components
+    progress_reporter = SlackProgressReporter(client=slack_client)
+    approval_manager = ApprovalManager(slack_client=slack_client)
+
+    # Wire callback server → progress reporter + approval manager + queue
+    def handle_callback_event(event: dict):
+        """Dispatch runner callback events."""
+        event_type = event.get("event_type", "")
+        job_id = event.get("job_id", "")
+        data = event.get("data", {})
+
+        # Forward to progress reporter for Slack updates
+        progress_reporter.handle_event(event)
+
+        # Track approval requests
+        if event_type == "approval_needed":
+            job = progress_reporter._jobs.get(job_id)
+            if job:
+                approval_manager.register_pending(
+                    job_id=job_id,
+                    tool_use_id=data.get("tool_use_id", ""),
+                    tool_name=data.get("tool_name", ""),
+                    channel_id=job["channel_id"],
+                    thread_ts=job["thread_ts"],
+                )
+
+        # Clear pending approval on timeout
+        if event_type == "approval_timeout":
+            approval_manager.clear_job(job_id)
+
+        # Mark job as completed in the queue
+        if event_type in ("completed", "failed"):
+            queue.mark_completed(job_id)
+
+    # Start callback server on port 8001
+    start_callback_server(handle_callback_event)
+    log.info("Callback server running on port 8001")
+
+    # Create the Slack app with all components
+    slack_app = create_slack_app(
+        queue=queue,
+        progress_reporter=progress_reporter,
+        approval_manager=approval_manager,
+    )
+
+    # Wire up the lifecycle callback with the Slack client
     queue.callback = SlackCallback(client=slack_app.client)
 
     log.info("Connecting to Slack via Socket Mode...")

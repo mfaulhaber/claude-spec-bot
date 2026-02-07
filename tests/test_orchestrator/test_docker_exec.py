@@ -1,88 +1,159 @@
-"""Tests for orchestrator_host.docker_exec (mocked subprocess)."""
+"""Tests for orchestrator_host.docker_exec (HTTP client)."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
+from unittest.mock import patch
 
 from orchestrator_host.docker_exec import (
-    build_docker_command,
-    cancel_job_container,
-    container_name,
-    run_in_runner,
+    cancel_agent_job,
+    check_runner_health,
+    get_agent_status,
+    send_approval,
+    send_message,
+    start_agent_job,
 )
 
 
-class TestContainerName:
-    def test_format(self):
-        assert container_name("abc-123", "bootstrap") == "poc-job-abc-123-bootstrap"
+class _MockRunnerHandler(BaseHTTPRequestHandler):
+    """Captures requests for test assertions."""
+
+    requests = []
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(content_length)) if content_length else {}
+        self.requests.append({"method": "POST", "path": self.path, "body": body})
+        self._respond(200, {"status": "ok"})
+
+    def do_GET(self):
+        self.requests.append({"method": "GET", "path": self.path})
+        self._respond(200, {"status": "ok", "service": "poc-runner"})
+
+    def _respond(self, code, data):
+        payload = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
 
 
-class TestBuildDockerCommand:
-    def test_includes_name_and_tee(self):
-        cmd = build_docker_command("job-1", "test", "scripts/test.sh")
-        assert cmd[:4] == ["docker", "compose", "run", "--rm"]
-        assert "--name" in cmd
-        assert "poc-job-job-1-test" in cmd
-        assert "runner" in cmd
-        assert "bash" in cmd
-        # Check shell command includes tee
-        shell_cmd = cmd[-1]
-        assert "scripts/test.sh" in shell_cmd
-        assert "tee" in shell_cmd
-        assert "/runner/jobs/job-1/logs/test.log" in shell_cmd
+class TestStartAgentJob:
+    def test_posts_to_runner(self):
+        _MockRunnerHandler.requests.clear()
+        server = HTTPServer(("127.0.0.1", 0), _MockRunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+
+        with patch("orchestrator_host.docker_exec.RUNNER_URL", f"http://127.0.0.1:{port}"):
+            result = start_agent_job(
+                "job-1", "Fix the bug", "http://callback:8001/events",
+                model="claude-sonnet-4-5-20250929",
+            )
+
+        assert result["status"] == "ok"
+        req = _MockRunnerHandler.requests[0]
+        assert req["path"] == "/jobs/job-1/start"
+        assert req["body"]["goal"] == "Fix the bug"
+        assert req["body"]["callback_url"] == "http://callback:8001/events"
+        server.server_close()
+
+    def test_handles_unreachable(self):
+        with patch("orchestrator_host.docker_exec.RUNNER_URL", "http://127.0.0.1:1"):
+            result = start_agent_job("job-1", "goal", "http://callback:8001/events", timeout=1)
+        assert result.get("error")
 
 
-class TestRunInRunner:
-    @patch("orchestrator_host.docker_exec.subprocess.run")
-    def test_success(self, mock_run, tmp_path, monkeypatch):
-        monkeypatch.setattr("orchestrator_host.state.JOBS_DIR", tmp_path / "jobs")
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
-        result = run_in_runner("job-1", "bootstrap", "scripts/bootstrap.sh")
-        assert result.exit_code == 0
-        assert not result.was_cancelled
-        mock_run.assert_called_once()
+class TestSendApproval:
+    def test_posts_approval(self):
+        _MockRunnerHandler.requests.clear()
+        server = HTTPServer(("127.0.0.1", 0), _MockRunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
 
-    @patch("orchestrator_host.docker_exec.subprocess.run")
-    def test_failure(self, mock_run, tmp_path, monkeypatch):
-        monkeypatch.setattr("orchestrator_host.state.JOBS_DIR", tmp_path / "jobs")
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
-        result = run_in_runner("job-1", "bootstrap", "scripts/bootstrap.sh")
-        assert result.exit_code == 1
-        assert not result.was_cancelled
+        with patch("orchestrator_host.docker_exec.RUNNER_URL", f"http://127.0.0.1:{port}"):
+            result = send_approval("job-1", "tu-123", approved=True, auto_approve_tool=True)
 
-    @patch("orchestrator_host.docker_exec.cancel_job_container")
-    @patch("orchestrator_host.docker_exec.subprocess.run")
-    def test_timeout(self, mock_run, mock_cancel, tmp_path, monkeypatch):
-        import subprocess
-
-        monkeypatch.setattr("orchestrator_host.state.JOBS_DIR", tmp_path / "jobs")
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="docker", timeout=600)
-        result = run_in_runner("job-1", "test", "scripts/test.sh")
-        assert result.exit_code == -1
-        assert result.was_cancelled
-        mock_cancel.assert_called_once_with("job-1", "test")
+        assert result["status"] == "ok"
+        req = _MockRunnerHandler.requests[0]
+        assert req["path"] == "/jobs/job-1/approve"
+        assert req["body"]["approved"] is True
+        assert req["body"]["auto_approve_tool"] is True
+        server.server_close()
 
 
-class TestCancelJobContainer:
-    @patch("orchestrator_host.docker_exec.subprocess.run")
-    def test_stop_called(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0)
-        cancel_job_container("job-1", "test")
-        args = mock_run.call_args[0][0]
-        assert args[:2] == ["docker", "stop"]
-        assert "poc-job-job-1-test" in args
+class TestSendMessage:
+    def test_posts_message(self):
+        _MockRunnerHandler.requests.clear()
+        server = HTTPServer(("127.0.0.1", 0), _MockRunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
 
-    @patch("orchestrator_host.docker_exec.subprocess.run")
-    def test_fallback_to_kill(self, mock_run):
-        import subprocess
+        with patch("orchestrator_host.docker_exec.RUNNER_URL", f"http://127.0.0.1:{port}"):
+            result = send_message("job-1", "do this instead")
 
-        # First call (stop) times out, second call (kill) succeeds
-        mock_run.side_effect = [
-            subprocess.TimeoutExpired(cmd="docker", timeout=15),
-            MagicMock(returncode=0),
-        ]
-        cancel_job_container("job-1", "test")
-        assert mock_run.call_count == 2
-        # Second call should be docker kill
-        kill_args = mock_run.call_args_list[1][0][0]
-        assert kill_args[:2] == ["docker", "kill"]
+        assert result["status"] == "ok"
+        req = _MockRunnerHandler.requests[0]
+        assert req["path"] == "/jobs/job-1/message"
+        assert req["body"]["message"] == "do this instead"
+        server.server_close()
+
+
+class TestCancelAgentJob:
+    def test_posts_cancel(self):
+        _MockRunnerHandler.requests.clear()
+        server = HTTPServer(("127.0.0.1", 0), _MockRunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+
+        with patch("orchestrator_host.docker_exec.RUNNER_URL", f"http://127.0.0.1:{port}"):
+            result = cancel_agent_job("job-1")
+
+        assert result["status"] == "ok"
+        req = _MockRunnerHandler.requests[0]
+        assert req["path"] == "/jobs/job-1/cancel"
+        server.server_close()
+
+
+class TestCheckRunnerHealth:
+    def test_gets_health(self):
+        _MockRunnerHandler.requests.clear()
+        server = HTTPServer(("127.0.0.1", 0), _MockRunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+
+        with patch("orchestrator_host.docker_exec.RUNNER_URL", f"http://127.0.0.1:{port}"):
+            result = check_runner_health()
+
+        assert result["status"] == "ok"
+        req = _MockRunnerHandler.requests[0]
+        assert req["path"] == "/health"
+        server.server_close()
+
+
+class TestGetAgentStatus:
+    def test_gets_status(self):
+        _MockRunnerHandler.requests.clear()
+        server = HTTPServer(("127.0.0.1", 0), _MockRunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+
+        with patch("orchestrator_host.docker_exec.RUNNER_URL", f"http://127.0.0.1:{port}"):
+            result = get_agent_status("job-1")
+
+        assert result["status"] == "ok"
+        req = _MockRunnerHandler.requests[0]
+        assert req["path"] == "/jobs/job-1/status"
+        server.server_close()

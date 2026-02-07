@@ -1,138 +1,110 @@
-"""Docker Compose subprocess execution for the POC runner."""
+"""HTTP client for communicating with the runner agent."""
 
 from __future__ import annotations
 
 import json
 import logging
-import signal
-import subprocess
 import urllib.request
-from dataclasses import dataclass
-
-from orchestrator_host.state import job_logs_dir
 
 log = logging.getLogger(__name__)
 
 RUNNER_URL = "http://localhost:8000"
 
 
-@dataclass
-class RunResult:
-    exit_code: int
-    was_cancelled: bool = False
-
-
-def container_name(job_id: str, step_id: str) -> str:
-    """Return the Docker container name for a job step."""
-    return f"poc-job-{job_id}-{step_id}"
-
-
-def build_docker_command(job_id: str, step_id: str, command: str) -> list[str]:
-    """Build the docker compose run command list."""
-    name = container_name(job_id, step_id)
-    log_path = f"/runner/jobs/{job_id}/logs/{step_id}.log"
-    shell_cmd = f"{command} |& tee {log_path}"
-    return [
-        "docker",
-        "compose",
-        "run",
-        "--rm",
-        "--name",
-        name,
-        "runner",
-        "bash",
-        "-lc",
-        shell_cmd,
-    ]
-
-
-def run_in_runner(
+def start_agent_job(
     job_id: str,
-    step_id: str,
-    command: str,
+    goal: str,
+    callback_url: str,
     *,
-    timeout: int | None = 600,
-) -> RunResult:
-    """Execute a command inside the Docker runner service.
+    permissions: dict[str, str] | None = None,
+    model: str = "",
+    max_iterations: int = 200,
+    timeout: int = 30,
+) -> dict:
+    """Start an agent session on the runner. POSTs to /jobs/{job_id}/start."""
+    payload: dict = {
+        "goal": goal,
+        "callback_url": callback_url,
+    }
+    if permissions:
+        payload["permissions"] = permissions
+    if model:
+        payload["model"] = model
+    if max_iterations != 200:
+        payload["max_iterations"] = max_iterations
 
-    Returns a RunResult with exit_code and cancellation flag.
-    """
-    cmd = build_docker_command(job_id, step_id, command)
-    log_dir = job_logs_dir(job_id)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info("Running step %s for job %s: %s", step_id, job_id, " ".join(cmd))
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-        )
-        if proc.stdout:
-            log.debug("stdout [%s/%s]: %s", job_id, step_id, proc.stdout[-500:])
-        if proc.stderr:
-            log.debug("stderr [%s/%s]: %s", job_id, step_id, proc.stderr[-500:])
-        return RunResult(exit_code=proc.returncode)
-    except subprocess.TimeoutExpired:
-        log.warning("Step %s for job %s timed out after %ds", step_id, job_id, timeout)
-        cancel_job_container(job_id, step_id)
-        return RunResult(exit_code=-1, was_cancelled=True)
+    return _post(f"/jobs/{job_id}/start", payload, timeout=timeout)
 
 
-def cancel_job_container(job_id: str, step_id: str) -> None:
-    """Stop a running container for a job step (best-effort)."""
-    name = container_name(job_id, step_id)
-    log.info("Stopping container %s", name)
-    try:
-        subprocess.run(
-            ["docker", "stop", "-t", "5", name],
-            timeout=15,
-            capture_output=True,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        log.warning("Failed to stop container %s gracefully, trying kill", name)
-        try:
-            subprocess.run(
-                ["docker", "kill", name],
-                timeout=10,
-                capture_output=True,
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            log.error("Failed to kill container %s", name)
+def send_approval(
+    job_id: str,
+    tool_use_id: str,
+    *,
+    approved: bool = True,
+    auto_approve_tool: bool = False,
+    timeout: int = 10,
+) -> dict:
+    """Send an approval/denial to the runner. POSTs to /jobs/{job_id}/approve."""
+    payload = {
+        "tool_use_id": tool_use_id,
+        "approved": approved,
+        "auto_approve_tool": auto_approve_tool,
+    }
+    return _post(f"/jobs/{job_id}/approve", payload, timeout=timeout)
 
 
-def send_message_to_runner(job_id: str, message: str, *, timeout: int = 30) -> dict:
-    """Send a message to the runner's HTTP handler and return the response."""
-    payload = json.dumps({"job_id": job_id, "message": message}).encode()
+def send_message(job_id: str, message: str, *, timeout: int = 10) -> dict:
+    """Send a follow-up message to the agent. POSTs to /jobs/{job_id}/message."""
+    return _post(f"/jobs/{job_id}/message", {"message": message}, timeout=timeout)
+
+
+def cancel_agent_job(job_id: str, *, timeout: int = 10) -> dict:
+    """Cancel a running agent session. POSTs to /jobs/{job_id}/cancel."""
+    return _post(f"/jobs/{job_id}/cancel", {}, timeout=timeout)
+
+
+def get_agent_status(job_id: str, *, timeout: int = 10) -> dict:
+    """Get agent session status. GETs /jobs/{job_id}/status."""
+    return _get(f"/jobs/{job_id}/status", timeout=timeout)
+
+
+def check_runner_health(*, timeout: int = 5) -> dict:
+    """Check if the runner is healthy. GETs /health."""
+    return _get("/health", timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Internal HTTP helpers
+# ---------------------------------------------------------------------------
+
+
+def _post(path: str, payload: dict, *, timeout: int = 30) -> dict:
+    """POST JSON to the runner."""
+    url = f"{RUNNER_URL}{path}"
+    data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        RUNNER_URL,
-        data=payload,
+        url,
+        data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    log.info("Sending message to runner for job %s: %s", job_id, message)
+    log.debug("POST %s", url)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-            log.info("Runner response for job %s: %s", job_id, data.get("reply", ""))
-            return data
+            return json.loads(resp.read().decode())
     except Exception:
-        log.exception("Failed to send message to runner for job %s", job_id)
-        return {"error": "Runner unreachable", "job_id": job_id, "status": "failed"}
+        log.exception("Failed to POST to %s", url)
+        return {"error": "Runner unreachable", "status": "failed"}
 
 
-def cancel_subprocess(proc: subprocess.Popen, job_id: str, step_id: str) -> None:
-    """Terminate a subprocess and its container."""
-    log.info("Cancelling subprocess for %s/%s (pid=%s)", job_id, step_id, proc.pid)
+def _get(path: str, *, timeout: int = 10) -> dict:
+    """GET JSON from the runner."""
+    url = f"{RUNNER_URL}{path}"
+    req = urllib.request.Request(url, method="GET")
+    log.debug("GET %s", url)
     try:
-        proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout=5)
-    except (subprocess.TimeoutExpired, ProcessLookupError):
-        try:
-            proc.kill()
-            proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, ProcessLookupError):
-            pass
-    cancel_job_container(job_id, step_id)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        log.exception("Failed to GET %s", url)
+        return {"error": "Runner unreachable", "status": "failed"}

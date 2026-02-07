@@ -25,25 +25,9 @@ def generate_job_id() -> str:
 
 # --- Data model ---
 
-VALID_PHASES = ("QUEUED", "RUNNING", "BLOCKED", "DONE", "FAILED", "CANCELLED")
-VALID_STEP_STATUSES = ("pending", "running", "done", "failed", "skipped")
-
-
-@dataclass
-class StepState:
-    id: str
-    command: str
-    status: str = "pending"
-    exit_code: int | None = None
-    started_at: str | None = None
-    finished_at: str | None = None
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> StepState:
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+VALID_PHASES = (
+    "QUEUED", "RUNNING", "WAITING_APPROVAL", "BLOCKED", "DONE", "FAILED", "CANCELLED"
+)
 
 
 @dataclass
@@ -57,9 +41,16 @@ class JobState:
     original_message_ts: str = ""
     created_at: str = ""
     updated_at: str = ""
-    steps: list[StepState] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
     error: str | None = None
+    # Agent-mode fields
+    model: str = "claude-sonnet-4-5-20250929"
+    agent_iteration: int = 0
+    max_iterations: int = 200
+    approved_tools: list[str] = field(default_factory=list)
+    callback_url: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def __post_init__(self):
         now = _utcnow_iso()
@@ -69,19 +60,13 @@ class JobState:
             self.updated_at = now
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        d["steps"] = [s.to_dict() for s in self.steps]
-        return d
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> JobState:
-        steps_raw = d.pop("steps", [])
-        steps = [StepState.from_dict(s) for s in steps_raw]
         known = {k for k in cls.__dataclass_fields__}
         filtered = {k: v for k, v in d.items() if k in known}
-        obj = cls(**filtered)
-        obj.steps = steps
-        return obj
+        return cls(**filtered)
 
     def touch(self) -> None:
         """Update the updated_at timestamp."""
@@ -164,25 +149,20 @@ def list_jobs() -> list[str]:
     return sorted(ids)
 
 
-# --- Default pipeline ---
-
-DEFAULT_STEPS = [
-    StepState(id="bootstrap", command="scripts/bootstrap.sh"),
-    StepState(id="doctor", command="scripts/doctor.sh"),
-    StepState(id="lint", command="scripts/lint.sh"),
-    StepState(id="test", command="scripts/test.sh"),
-]
-
-
-def create_job(goal: str, requested_by: str = "", channel_id: str = "") -> JobState:
-    """Create a new job with the default pipeline steps."""
+def create_job(
+    goal: str,
+    requested_by: str = "",
+    channel_id: str = "",
+    model: str = "claude-sonnet-4-5-20250929",
+) -> JobState:
+    """Create a new job for the agent."""
     job_id = generate_job_id()
     state = JobState(
         job_id=job_id,
         goal=goal,
         requested_by=requested_by,
         channel_id=channel_id,
-        steps=[StepState(id=s.id, command=s.command) for s in DEFAULT_STEPS],
+        model=model,
     )
     save_state(state)
     return state
