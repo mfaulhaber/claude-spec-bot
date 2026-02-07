@@ -16,9 +16,8 @@ def start_agent_job(
     goal: str,
     callback_url: str,
     *,
-    permissions: dict[str, str] | None = None,
     model: str = "",
-    max_iterations: int = 200,
+    max_turns: int = 200,
     timeout: int = 30,
 ) -> dict:
     """Start an agent session on the runner. POSTs to /jobs/{job_id}/start."""
@@ -26,12 +25,10 @@ def start_agent_job(
         "goal": goal,
         "callback_url": callback_url,
     }
-    if permissions:
-        payload["permissions"] = permissions
     if model:
         payload["model"] = model
-    if max_iterations != 200:
-        payload["max_iterations"] = max_iterations
+    if max_turns != 200:
+        payload["max_turns"] = max_turns
 
     return _post(f"/jobs/{job_id}/start", payload, timeout=timeout)
 

@@ -38,7 +38,7 @@ class TestJobState:
         assert j.updated_at
         assert j.model == "claude-sonnet-4-5-20250929"
         assert j.agent_iteration == 0
-        assert j.max_iterations == 200
+        assert j.max_turns == 200
         assert j.approved_tools == []
         assert j.input_tokens == 0
         assert j.output_tokens == 0

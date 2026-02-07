@@ -1,13 +1,16 @@
-"""Tests for poc.agent — agent loop, tool dispatch, approvals."""
+"""Tests for poc.agent — SDK-based agent loop, approval workflow."""
 
 from __future__ import annotations
 
+import asyncio
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
-from poc.agent import AgentSession, _summarize_input
+from poc.agent import APPROVAL_REQUIRED_TOOLS, AgentSession
 from poc.callback import NullCallbackClient
 
 
@@ -17,389 +20,393 @@ def _patch_jobs_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("poc.agent.JOBS_DIR", tmp_path / "jobs")
 
 
-class TestAgentSession:
-    def _make_session(self, **kwargs) -> AgentSession:
-        defaults = {
-            "job_id": "test-1",
-            "goal": "List all Python files",
-            "model": "claude-sonnet-4-5-20250929",
-            "max_iterations": 5,
-        }
-        defaults.update(kwargs)
-        session = AgentSession(**defaults)
-        session._callback = NullCallbackClient()
-        return session
+def _make_session(**kwargs) -> AgentSession:
+    defaults = {
+        "job_id": "test-1",
+        "goal": "List all Python files",
+        "model": "claude-sonnet-4-5-20250929",
+        "max_turns": 5,
+    }
+    defaults.update(kwargs)
+    session = AgentSession(**defaults)
+    session._callback = NullCallbackClient()
+    return session
 
-    @patch("poc.agent.ClaudeClient")
-    def test_simple_text_response(self, mock_client_cls):
-        """Agent gets a text response with no tool use -> completes."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
 
-        # Mock a simple text response
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Here are the Python files."
+def _make_result_message(result="Done.", is_error=False, num_turns=1):
+    """Create a ResultMessage mock."""
+    msg = MagicMock(spec=ResultMessage)
+    msg.result = result
+    msg.is_error = is_error
+    msg.num_turns = num_turns
+    msg.duration_ms = 5000
+    msg.total_cost_usd = 0.01
+    # Make isinstance checks work
+    msg.__class__ = ResultMessage
+    return msg
 
-        response = MagicMock()
-        response.content = [text_block]
-        response.stop_reason = "end_turn"
-        response.usage = MagicMock(input_tokens=100, output_tokens=50)
-        mock_client.create_message.return_value = response
-        mock_client.usage = MagicMock(input_tokens=100, output_tokens=50)
 
-        session = self._make_session()
-        session.start()
-        session._thread.join(timeout=5)
+def _make_assistant_message(content):
+    """Create an AssistantMessage mock."""
+    msg = MagicMock(spec=AssistantMessage)
+    msg.content = content
+    msg.__class__ = AssistantMessage
+    return msg
 
-        assert session.status == "completed"
-        assert "Python files" in session.result_text
 
-    @patch("poc.agent.execute_tool")
-    @patch("poc.agent.ClaudeClient")
-    def test_tool_use_auto_approved(self, mock_client_cls, mock_exec):
-        """Auto-approved tools (list_files) execute without waiting."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-        mock_exec.return_value = "1\thello.py\n2\tworld.py"
+class TestCanUseTool:
+    """Test the _can_use_tool permission callback directly (async)."""
 
-        # First call: tool use
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = "tu-1"
-        tool_block.name = "list_files"
-        tool_block.input = {"pattern": "*.py"}
+    @pytest.mark.asyncio
+    async def test_auto_approve_read(self):
+        """Read tool should be auto-approved."""
+        session = _make_session()
+        session._approval_event = asyncio.Event()
+        result = await session._can_use_tool("Read", {"file_path": "x.py"}, MagicMock())
+        assert isinstance(result, PermissionResultAllow)
 
-        resp1 = MagicMock()
-        resp1.content = [tool_block]
-        resp1.stop_reason = "tool_use"
-        resp1.usage = MagicMock(input_tokens=50, output_tokens=30)
+    @pytest.mark.asyncio
+    async def test_auto_approve_glob(self):
+        session = _make_session()
+        session._approval_event = asyncio.Event()
+        result = await session._can_use_tool("Glob", {"pattern": "*.py"}, MagicMock())
+        assert isinstance(result, PermissionResultAllow)
 
-        # Second call: text response
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Found 2 files."
-        resp2 = MagicMock()
-        resp2.content = [text_block]
-        resp2.stop_reason = "end_turn"
-        resp2.usage = MagicMock(input_tokens=100, output_tokens=50)
+    @pytest.mark.asyncio
+    async def test_auto_approve_grep(self):
+        session = _make_session()
+        session._approval_event = asyncio.Event()
+        result = await session._can_use_tool("Grep", {"pattern": "TODO"}, MagicMock())
+        assert isinstance(result, PermissionResultAllow)
 
-        mock_client.create_message.side_effect = [resp1, resp2]
-        mock_client.usage = MagicMock(input_tokens=150, output_tokens=80)
+    @pytest.mark.asyncio
+    async def test_bash_needs_approval(self):
+        """Bash requires approval - verify it pauses."""
+        session = _make_session(approval_timeout=1)
+        session._approval_event = asyncio.Event()
+        # Don't approve -> should time out
+        result = await session._can_use_tool("Bash", {"command": "ls"}, MagicMock())
+        assert isinstance(result, PermissionResultDeny)
+        assert "timed out" in result.message
 
-        session = self._make_session()
-        session.start()
-        session._thread.join(timeout=5)
+    @pytest.mark.asyncio
+    async def test_write_needs_approval(self):
+        session = _make_session(approval_timeout=1)
+        session._approval_event = asyncio.Event()
+        result = await session._can_use_tool("Write", {"file_path": "x.py"}, MagicMock())
+        assert isinstance(result, PermissionResultDeny)
 
-        assert session.status == "completed"
-        mock_exec.assert_called_once_with("list_files", {"pattern": "*.py"})
+    @pytest.mark.asyncio
+    async def test_edit_needs_approval(self):
+        session = _make_session(approval_timeout=1)
+        session._approval_event = asyncio.Event()
+        result = await session._can_use_tool("Edit", {"file_path": "x.py"}, MagicMock())
+        assert isinstance(result, PermissionResultDeny)
 
-    @patch("poc.agent.execute_tool")
-    @patch("poc.agent.ClaudeClient")
-    def test_tool_approval_flow(self, mock_client_cls, mock_exec):
-        """Tools requiring approval pause and resume correctly."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-        mock_exec.return_value = "ok"
+    @pytest.mark.asyncio
+    async def test_approved_tool_auto_allows(self):
+        """Previously approved tools don't require re-approval."""
+        session = _make_session()
+        session._approval_event = asyncio.Event()
+        session.approved_tools.add("Bash")
+        result = await session._can_use_tool("Bash", {"command": "ls"}, MagicMock())
+        assert isinstance(result, PermissionResultAllow)
 
-        # Tool use for bash (needs approval)
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = "tu-bash"
-        tool_block.name = "bash"
-        tool_block.input = {"command": "echo hello"}
+    @pytest.mark.asyncio
+    async def test_approval_granted(self):
+        """Approval flow: approve in a background task, verify Allow is returned."""
+        session = _make_session()
+        session._approval_event = asyncio.Event()
 
-        resp1 = MagicMock()
-        resp1.content = [tool_block]
-        resp1.stop_reason = "tool_use"
-        resp1.usage = MagicMock(input_tokens=50, output_tokens=30)
+        async def approve_after_delay():
+            await asyncio.sleep(0.1)
+            session.pending_approval = {
+                "tool_use_id": session.pending_approval["tool_use_id"],
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+            }
+            session._approval_granted = True
+            session._approval_event.set()
 
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "Done."
-        resp2 = MagicMock()
-        resp2.content = [text_block]
-        resp2.stop_reason = "end_turn"
-        resp2.usage = MagicMock(input_tokens=100, output_tokens=50)
+        task = asyncio.create_task(approve_after_delay())
+        result = await session._can_use_tool("Bash", {"command": "echo hi"}, MagicMock())
+        await task
+        assert isinstance(result, PermissionResultAllow)
 
-        mock_client.create_message.side_effect = [resp1, resp2]
-        mock_client.usage = MagicMock(input_tokens=150, output_tokens=80)
+    @pytest.mark.asyncio
+    async def test_approval_denied(self):
+        """Denial flow: deny in a background task, verify Deny is returned."""
+        session = _make_session()
+        session._approval_event = asyncio.Event()
 
-        session = self._make_session()
-        session.start()
+        async def deny_after_delay():
+            await asyncio.sleep(0.1)
+            session._approval_granted = False
+            session._approval_event.set()
 
-        # Wait for approval request
-        for _ in range(50):
-            if session.status == "waiting_approval":
-                break
-            time.sleep(0.1)
-        assert session.status == "waiting_approval"
-        assert session.pending_approval is not None
-        assert session.pending_approval["tool_use_id"] == "tu-bash"
+        task = asyncio.create_task(deny_after_delay())
+        result = await session._can_use_tool("Bash", {"command": "rm -rf /"}, MagicMock())
+        await task
+        assert isinstance(result, PermissionResultDeny)
+        assert "denied by the user" in result.message
 
-        # Approve
-        session.approve("tu-bash")
+    @pytest.mark.asyncio
+    async def test_approval_timeout_events(self):
+        """Timeout posts approval_timeout event."""
+        session = _make_session(approval_timeout=1)
+        session._approval_event = asyncio.Event()
 
-        session._thread.join(timeout=5)
-        assert session.status == "completed"
-        mock_exec.assert_called_once_with("bash", {"command": "echo hello"})
+        await session._can_use_tool("Bash", {"command": "echo timeout"}, MagicMock())
 
-    @patch("poc.agent.execute_tool")
-    @patch("poc.agent.ClaudeClient")
-    def test_tool_denial(self, mock_client_cls, mock_exec):
-        """Denied tools return denial message to Claude."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-
-        # Tool use for bash
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = "tu-bash"
-        tool_block.name = "bash"
-        tool_block.input = {"command": "rm -rf /"}
-
-        resp1 = MagicMock()
-        resp1.content = [tool_block]
-        resp1.stop_reason = "tool_use"
-        resp1.usage = MagicMock(input_tokens=50, output_tokens=30)
-
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "OK, I won't do that."
-        resp2 = MagicMock()
-        resp2.content = [text_block]
-        resp2.stop_reason = "end_turn"
-        resp2.usage = MagicMock(input_tokens=100, output_tokens=50)
-
-        mock_client.create_message.side_effect = [resp1, resp2]
-        mock_client.usage = MagicMock(input_tokens=150, output_tokens=80)
-
-        session = self._make_session()
-        session.start()
-
-        for _ in range(50):
-            if session.status == "waiting_approval":
-                break
-            time.sleep(0.1)
-
-        session.deny("tu-bash")
-        session._thread.join(timeout=5)
-
-        assert session.status == "completed"
-        # Tool should not have been executed
-        mock_exec.assert_not_called()
-        # The conversation should contain the denial message
-        tool_results = [m for m in session.conversation if isinstance(m.get("content"), list)]
-        assert any(
-            "denied" in str(r.get("content", "")).lower()
-            for r in tool_results
-            if isinstance(r.get("content"), list)
-        )
-
-    @patch("poc.agent.execute_tool")
-    @patch("poc.agent.ClaudeClient")
-    def test_cancellation(self, mock_client_cls, mock_exec):
-        """Cancel stops the agent loop during tool processing."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-        mock_exec.return_value = "ok"
-
-        # Return tool uses to keep the loop going, cancel during tool approval wait
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = "tu-cancel"
-        tool_block.name = "bash"
-        tool_block.input = {"command": "sleep 10"}
-
-        response = MagicMock()
-        response.content = [tool_block]
-        response.stop_reason = "tool_use"
-        response.usage = MagicMock(input_tokens=10, output_tokens=10)
-
-        mock_client.create_message.return_value = response
-        mock_client.usage = MagicMock(input_tokens=10, output_tokens=10)
-
-        session = self._make_session()
-        session.start()
-
-        # Wait for approval request
-        for _ in range(50):
-            if session.status == "waiting_approval":
-                break
-            time.sleep(0.1)
-        assert session.status == "waiting_approval"
-
-        # Cancel while waiting for approval
-        session.cancel()
-        session._thread.join(timeout=5)
-
-        assert session.status == "cancelled"
-
-    @patch("poc.agent.ClaudeClient")
-    def test_max_iterations(self, mock_client_cls):
-        """Agent stops after max iterations."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-
-        # Always return a tool use to keep the loop going
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = "tu-1"
-        tool_block.name = "list_files"
-        tool_block.input = {"pattern": "*.py"}
-
-        response = MagicMock()
-        response.content = [tool_block]
-        response.stop_reason = "tool_use"
-        response.usage = MagicMock(input_tokens=10, output_tokens=10)
-
-        mock_client.create_message.return_value = response
-        mock_client.usage = MagicMock(input_tokens=100, output_tokens=100)
-
-        with patch("poc.agent.execute_tool", return_value="files"):
-            session = self._make_session(max_iterations=3)
-            session.start()
-            session._thread.join(timeout=10)
-
-        assert session.status == "completed"
-        assert session.iteration == 3
-
-    @patch("poc.agent.execute_tool")
-    @patch("poc.agent.ClaudeClient")
-    def test_approval_timeout(self, mock_client_cls, mock_exec):
-        """Approval times out and is treated as a denial."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
-
-        # Tool use for bash (needs approval)
-        tool_block = MagicMock()
-        tool_block.type = "tool_use"
-        tool_block.id = "tu-timeout"
-        tool_block.name = "bash"
-        tool_block.input = {"command": "echo timeout"}
-
-        resp1 = MagicMock()
-        resp1.content = [tool_block]
-        resp1.stop_reason = "tool_use"
-        resp1.usage = MagicMock(input_tokens=50, output_tokens=30)
-
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "OK, timed out."
-        resp2 = MagicMock()
-        resp2.content = [text_block]
-        resp2.stop_reason = "end_turn"
-        resp2.usage = MagicMock(input_tokens=100, output_tokens=50)
-
-        mock_client.create_message.side_effect = [resp1, resp2]
-        mock_client.usage = MagicMock(input_tokens=150, output_tokens=80)
-
-        session = self._make_session(approval_timeout=1)  # 1 second timeout
-        session.start()
-
-        # Wait for approval request
-        for _ in range(50):
-            if session.status == "waiting_approval":
-                break
-            time.sleep(0.1)
-        assert session.status == "waiting_approval"
-
-        # Don't approve — let it time out
-        session._thread.join(timeout=5)
-
-        assert session.status == "completed"
-        # Tool should NOT have been executed (timed out = denied)
-        mock_exec.assert_not_called()
-        # Callback should have received approval_timeout event
         timeout_events = [
             e for e in session._callback.events if e["event_type"] == "approval_timeout"
         ]
         assert len(timeout_events) == 1
-        assert timeout_events[0]["data"]["tool_name"] == "bash"
+        assert timeout_events[0]["data"]["tool_name"] == "Bash"
+
+
+class TestAgentSessionSync:
+    """Test sync methods (approve, deny, cancel, add_message)."""
+
+    def test_approve_matching(self):
+        session = _make_session()
+        session._loop = asyncio.new_event_loop()
+        session._approval_event = session._loop.run_until_complete(
+            _create_async_event(session._loop)
+        )
+        session.pending_approval = {"tool_use_id": "tu-1", "tool_name": "Bash"}
+
+        ok = session.approve("tu-1")
+        assert ok
+        assert session._approval_granted
+
+        session._loop.close()
+
+    def test_approve_wrong_id(self):
+        session = _make_session()
+        session.pending_approval = {"tool_use_id": "tu-1", "tool_name": "Bash"}
+        ok = session.approve("wrong-id")
+        assert not ok
+
+    def test_approve_no_pending(self):
+        session = _make_session()
+        ok = session.approve("tu-1")
+        assert not ok
+
+    def test_approve_auto_approve_tool(self):
+        session = _make_session()
+        session._loop = asyncio.new_event_loop()
+        session._approval_event = session._loop.run_until_complete(
+            _create_async_event(session._loop)
+        )
+        session.pending_approval = {"tool_use_id": "tu-1", "tool_name": "Bash"}
+
+        session.approve("tu-1", auto_approve_tool=True)
+        assert "Bash" in session.approved_tools
+
+        session._loop.close()
+
+    def test_deny_matching(self):
+        session = _make_session()
+        session._loop = asyncio.new_event_loop()
+        session._approval_event = session._loop.run_until_complete(
+            _create_async_event(session._loop)
+        )
+        session.pending_approval = {"tool_use_id": "tu-1", "tool_name": "Bash"}
+
+        ok = session.deny("tu-1")
+        assert ok
+        assert not session._approval_granted
+
+        session._loop.close()
+
+    def test_deny_wrong_id(self):
+        session = _make_session()
+        session.pending_approval = {"tool_use_id": "tu-1", "tool_name": "Bash"}
+        ok = session.deny("wrong-id")
+        assert not ok
+
+    def test_cancel(self):
+        session = _make_session()
+        session.cancel()
+        assert session._cancel_requested
+
+    def test_cancel_while_waiting_approval(self):
+        session = _make_session()
+        session._loop = asyncio.new_event_loop()
+        session._approval_event = session._loop.run_until_complete(
+            _create_async_event(session._loop)
+        )
+        session.pending_approval = {"tool_use_id": "tu-1", "tool_name": "Bash"}
+
+        session.cancel()
+        assert session._cancel_requested
+        assert not session._approval_granted
+
+        session._loop.close()
 
     def test_add_message(self):
-        session = self._make_session()
-        session.add_message("additional instructions")
-        assert session.conversation[-1]["content"] == "additional instructions"
+        session = _make_session()
+        session.add_message("do something else")
+        assert session._queued_messages == ["do something else"]
 
 
-    @patch("poc.agent.ClaudeClient")
-    def test_server_tool_use_web_search(self, mock_client_cls):
-        """Agent handles server-side web search blocks without client execution."""
-        mock_client = MagicMock()
-        mock_client_cls.return_value = mock_client
+class _AsyncIterFromGen:
+    """Wraps an async generator so it works as an async iterator from a non-async mock."""
 
-        # Build a response containing server_tool_use + web_search_tool_result + text
-        server_tool_block = MagicMock()
-        server_tool_block.type = "server_tool_use"
-        server_tool_block.id = "stu-1"
-        server_tool_block.name = "web_search"
-        server_tool_block.input = {"query": "weather in Seattle"}
-        server_tool_block.model_dump = MagicMock(return_value={
-            "type": "server_tool_use",
-            "id": "stu-1",
-            "name": "web_search",
-            "input": {"query": "weather in Seattle"},
-        })
+    def __init__(self, gen_func):
+        self._gen_func = gen_func
 
-        search_result_item = MagicMock()
-        search_result_item.title = "Seattle Weather"
+    def __call__(self):
+        return self._gen_func()
 
-        search_result_block = MagicMock()
-        search_result_block.type = "web_search_tool_result"
-        search_result_block.tool_use_id = "stu-1"
-        search_result_block.content = [search_result_item]
-        search_result_block.model_dump = MagicMock(return_value={
-            "type": "web_search_tool_result",
-            "tool_use_id": "stu-1",
-            "content": [{"type": "web_search_result", "title": "Seattle Weather", "url": "https://example.com"}],
-        })
+    def __aiter__(self):
+        return self._gen_func().__aiter__()
 
-        text_block = MagicMock()
-        text_block.type = "text"
-        text_block.text = "The weather in Seattle is rainy."
+    async def __anext__(self):
+        pass  # Not used directly
 
-        response = MagicMock()
-        response.content = [server_tool_block, search_result_block, text_block]
-        response.stop_reason = "end_turn"
-        response.usage = MagicMock(input_tokens=200, output_tokens=100)
 
-        mock_client.create_message.return_value = response
-        mock_client.usage = MagicMock(input_tokens=200, output_tokens=100)
+def _setup_mock_client(mock_sdk_cls, messages_gen):
+    """Set up mock SDK client with an async message generator."""
+    mock_client = AsyncMock()
+    mock_sdk_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_sdk_cls.return_value.__aexit__ = AsyncMock(return_value=None)
 
-        session = self._make_session()
+    # receive_messages must return an async iterator directly (not a coroutine)
+    mock_client.receive_messages = _AsyncIterFromGen(messages_gen)
+    return mock_client
+
+
+class TestAgentSessionIntegration:
+    """Integration tests using mocked SDK client."""
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_simple_completion(self, mock_sdk_cls):
+        """Agent processes messages and completes."""
+        result_msg = _make_result_message("Here are the Python files.")
+
+        async def fake_messages():
+            yield _make_assistant_message([TextBlock(text="Found files.")])
+            yield result_msg
+
+        _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
         session.start()
-        session._thread.join(timeout=5)
+        session._thread.join(timeout=10)
 
         assert session.status == "completed"
-        assert "rainy" in session.result_text
+        assert session.result_text == "Here are the Python files."
 
-        # Verify assistant content includes the server tool blocks
-        assistant_msg = session.conversation[1]  # index 0 = user goal, 1 = assistant
-        assert assistant_msg["role"] == "assistant"
-        content_types = [c["type"] for c in assistant_msg["content"]]
-        assert "server_tool_use" in content_types
-        assert "web_search_tool_result" in content_types
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_error_completion(self, mock_sdk_cls):
+        """Agent handles error result."""
+        result_msg = _make_result_message("API Error", is_error=True)
 
-        # No tool_result user message should follow (no client-side execution)
-        assert len(session.conversation) == 2  # user + assistant only
+        async def fake_messages():
+            yield result_msg
+
+        _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
+        session.start()
+        session._thread.join(timeout=10)
+
+        assert session.status == "failed"
+        assert session.result_text == "API Error"
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_cancellation_during_messages(self, mock_sdk_cls):
+        """Cancel while processing messages."""
+
+        async def fake_messages():
+            yield _make_assistant_message([TextBlock(text="Working...")])
+            # Wait for cancel
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+            yield _make_result_message()
+
+        _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
+        session.start()
+        time.sleep(0.5)
+        session.cancel()
+        session._thread.join(timeout=10)
+
+        assert session.status == "cancelled"
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_exception_handling(self, mock_sdk_cls):
+        """Agent handles exceptions gracefully."""
+        mock_sdk_cls.return_value.__aenter__ = AsyncMock(
+            side_effect=RuntimeError("Connection failed")
+        )
+        mock_sdk_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        session = _make_session()
+        session.start()
+        session._thread.join(timeout=10)
+
+        assert session.status == "failed"
+        assert "Connection failed" in session.result_text
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_callback_events_emitted(self, mock_sdk_cls):
+        """Verify callback events are emitted for messages."""
+        result_msg = _make_result_message("Done.")
+
+        async def fake_messages():
+            yield _make_assistant_message([TextBlock(text="Working on it.")])
+            yield result_msg
+
+        _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
+        session.start()
+        session._thread.join(timeout=10)
+
+        event_types = [e["event_type"] for e in session._callback.events]
+        assert "progress" in event_types  # From "Agent started" + text block
+        assert "completed" in event_types
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_iteration_count(self, mock_sdk_cls):
+        """Verify iteration increments per AssistantMessage."""
+
+        async def fake_messages():
+            yield _make_assistant_message([TextBlock(text="Step 1")])
+            yield _make_assistant_message([TextBlock(text="Step 2")])
+            yield _make_assistant_message([TextBlock(text="Step 3")])
+            yield _make_result_message("All done.")
+
+        _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
+        session.start()
+        session._thread.join(timeout=10)
+
+        assert session.iteration == 3
 
 
-class TestSummarizeInput:
-    def test_bash(self):
-        assert _summarize_input("bash", {"command": "echo hi"}) == "echo hi"
+class TestApprovalRequiredTools:
+    def test_bash_requires_approval(self):
+        assert "Bash" in APPROVAL_REQUIRED_TOOLS
 
-    def test_read_file(self):
-        assert _summarize_input("read_file", {"path": "src/main.py"}) == "src/main.py"
+    def test_write_requires_approval(self):
+        assert "Write" in APPROVAL_REQUIRED_TOOLS
 
-    def test_list_files(self):
-        assert _summarize_input("list_files", {"pattern": "*.py"}) == "*.py"
+    def test_edit_requires_approval(self):
+        assert "Edit" in APPROVAL_REQUIRED_TOOLS
 
-    def test_web_search(self):
-        result = _summarize_input("web_search", {"query": "weather in Seattle"})
-        assert result == "weather in Seattle"
+    def test_read_does_not_require_approval(self):
+        assert "Read" not in APPROVAL_REQUIRED_TOOLS
 
-    def test_long_command_truncated(self):
-        cmd = "x" * 300
-        result = _summarize_input("bash", {"command": cmd})
-        assert len(result) <= 203
+    def test_glob_does_not_require_approval(self):
+        assert "Glob" not in APPROVAL_REQUIRED_TOOLS
+
+
+async def _create_async_event(loop):
+    """Helper to create an asyncio.Event in the given loop."""
+    return asyncio.Event()

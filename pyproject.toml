@@ -10,12 +10,13 @@ requires-python = ">=3.12"
 dependencies = [
     "click>=8.1",
     "httpx>=0.27",
-    "anthropic>=0.42",
+    "claude-agent-sdk",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.24",
     "ruff>=0.4",
 ]
 orchestrator = [

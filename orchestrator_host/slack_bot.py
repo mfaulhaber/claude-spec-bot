@@ -131,7 +131,7 @@ def format_job_status(state: JobState) -> str:
         f"{emoji} *Job {state.job_id}* — {state.phase}",
         f"Goal: _{state.goal}_",
         f"Model: `{state.model}`",
-        f"Iteration: {state.agent_iteration}/{state.max_iterations}",
+        f"Iteration: {state.agent_iteration}/{state.max_turns}",
     ]
 
     if state.input_tokens or state.output_tokens:

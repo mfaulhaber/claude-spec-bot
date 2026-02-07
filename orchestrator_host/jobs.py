@@ -131,7 +131,7 @@ class JobQueue:
                 goal=state.goal,
                 callback_url=state.callback_url or CALLBACK_URL,
                 model=state.model,
-                max_iterations=state.max_iterations,
+                max_turns=state.max_turns,
             )
 
             if response.get("error"):

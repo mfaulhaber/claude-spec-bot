@@ -4,7 +4,7 @@ An autonomous Claude Code agent running inside Docker, controlled via Slack. Use
 
 ## Components
 
-**POC Runner** (`src/poc/`) — An autonomous agent running inside Docker. Calls the Claude API directly, executes tools (bash, file I/O, search, web search), and reports progress via HTTP callbacks on port 8000.
+**POC Runner** (`src/poc/`) — An autonomous agent running inside Docker. Wraps the Claude Agent SDK (`claude-agent-sdk`) which provides Claude Code's built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch), and reports progress via HTTP callbacks on port 8000.
 
 **Orchestrator** (`orchestrator_host/`) — Host-side Slack bot that connects to Slack via Socket Mode, receives `!poc` commands, dispatches jobs to the runner, and relays progress/approval interactions back to Slack threads.
 
@@ -167,14 +167,13 @@ Per-job state is stored at `runner/jobs/<job_id>/state.json`.
 ```
 .
 ├── docker-compose.yml          # Runner service, port 8000, volume mounts
-├── Dockerfile.poc              # Python 3.12-slim + git + ripgrep
+├── Dockerfile.poc              # Python 3.12-slim + Node.js 20 + git + ripgrep
 ├── pyproject.toml              # Project config, deps, entry points
 ├── src/poc/                    # Runner package (runs in Docker)
 │   ├── __init__.py
 │   ├── handler.py              # Multi-endpoint HTTP API (port 8000)
-│   ├── agent.py                # AgentSession — core agent loop
-│   ├── claude_client.py        # Anthropic SDK wrapper with retry
-│   ├── tools.py                # Tool schemas and executors
+│   ├── agent.py                # AgentSession — wraps Claude Agent SDK with approval workflow
+│   ├── event_bridge.py         # Maps SDK messages/hooks to callback events
 │   └── callback.py             # HTTP event poster to orchestrator
 ├── orchestrator_host/          # Slack orchestrator (runs on host)
 │   ├── __init__.py
@@ -189,9 +188,8 @@ Per-job state is stored at `runner/jobs/<job_id>/state.json`.
 │   └── .env.example            # Template for Slack tokens
 ├── tests/
 │   ├── test_runner/            # Runner unit tests
-│   │   ├── test_tools.py
 │   │   ├── test_agent.py
-│   │   ├── test_claude_client.py
+│   │   ├── test_event_bridge.py
 │   │   └── test_handler.py
 │   └── test_orchestrator/      # Orchestrator unit tests
 │       ├── test_state.py
@@ -230,8 +228,8 @@ curl -s http://localhost:8000/health
 
 #### 3. Verify the Claude client can handle a job
 
-Submit a simple read-only task that uses only auto-approved tools (`list_files`).
-This confirms the API key is valid, the Claude client works, and the agent loop
+Submit a simple read-only task that uses only auto-approved tools (e.g., `Read`, `Glob`).
+This confirms the API key is valid, the Claude Agent SDK works, and the agent loop
 completes end-to-end without requiring any approval interaction.
 
 ```bash

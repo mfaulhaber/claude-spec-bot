@@ -73,25 +73,24 @@ class SlackProgressReporter:
         tool_input = data.get("tool_input", "")
         tool_use_id = data.get("tool_use_id", "")
 
-        text = f":gear: `{tool_name}`: `{tool_input[:200]}`"
+        text = f":hourglass_flowing_sand: `{tool_name}`: `{tool_input[:200]}`"
         ts = self._post(job, text)
         if ts and tool_use_id:
             job["tool_call_ts"][tool_use_id] = ts
+            job.setdefault("tool_inputs", {})[tool_use_id] = tool_input
 
     def _on_tool_result(self, job_id: str, job: dict, data: dict) -> None:
         tool_use_id = data.get("tool_use_id", "")
         tool_name = data.get("tool_name", "")
-        preview = data.get("result_preview", "")
 
-        msg_ts = job["tool_call_ts"].get(tool_use_id)
-        if msg_ts and preview:
-            # Edit the tool_call message to append the result
-            short = preview[:300].replace("```", "` ` `")
-            text = (
-                f":gear: `{tool_name}`: `{data.get('tool_input', '')[:200]}`\n"
-                f"```\n{short}\n```"
+        msg_ts = job["tool_call_ts"].pop(tool_use_id, None)
+        if msg_ts:
+            # Edit the tool_call message to show completion (no raw output)
+            tool_input = job.get("tool_inputs", {}).pop(tool_use_id, "")
+            self._edit(
+                job, msg_ts,
+                f":white_check_mark: `{tool_name}`: `{tool_input[:200]}`",
             )
-            self._edit(job, msg_ts, text)
 
     def _on_approval_needed(self, job_id: str, job: dict, data: dict) -> None:
         tool_name = data.get("tool_name", "unknown")
@@ -139,30 +138,35 @@ class SlackProgressReporter:
 
     def _on_progress(self, job_id: str, job: dict, data: dict) -> None:
         message = data.get("message", "")
-        iteration = data.get("iteration", "")
-        text = f":information_source: {message}"
-        if iteration:
-            text += f" (iteration {iteration})"
-        self._update_status(job, text)
+        if not message.strip():
+            return
+        # Show only a short snippet as rolling status — the full text
+        # will appear in the completed event.
+        short = message[:120].split("\n")[0]
+        if len(message) > 120:
+            short += "..."
+        self._update_status(job, f":speech_balloon: {short}")
 
     def _on_completed(self, job_id: str, job: dict, data: dict) -> None:
         status = data.get("status", "completed")
         message = data.get("message", "")
-        iterations = data.get("iterations", "?")
-        input_tokens = data.get("input_tokens", 0)
-        output_tokens = data.get("output_tokens", 0)
+        num_turns = data.get("num_turns", data.get("iterations", "?"))
+        total_cost = data.get("total_cost_usd")
+        duration_ms = data.get("duration_ms")
 
         if status == "cancelled":
             text = ":stop_sign: Agent cancelled."
         elif status == "max_iterations":
-            text = f":warning: Agent reached max iterations ({iterations})."
+            text = f":warning: Agent reached max turns ({num_turns})."
         else:
-            text = f":white_check_mark: Agent completed in {iterations} iterations."
+            text = f":white_check_mark: Agent completed in {num_turns} turns."
 
         if message:
             text += f"\n\n{message[:1500]}"
-        if input_tokens or output_tokens:
-            text += f"\n_Tokens: {input_tokens:,} in / {output_tokens:,} out_"
+        if total_cost is not None:
+            text += f"\n_Cost: ${total_cost:.4f}_"
+        if duration_ms:
+            text += f" _({duration_ms / 1000:.1f}s)_"
 
         self._post(job, text)
         # Clear the status message

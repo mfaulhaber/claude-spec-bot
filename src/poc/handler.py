@@ -105,8 +105,7 @@ class RunnerHandler(BaseHTTPRequestHandler):
             goal=goal,
             callback_url=body.get("callback_url", ""),
             model=body.get("model", ""),
-            permissions=body.get("permissions", {}),
-            max_iterations=body.get("max_iterations", 200),
+            max_turns=body.get("max_turns", 200),
             approval_timeout=body.get("approval_timeout", 600),
         )
         self.sessions[job_id] = session
@@ -172,7 +171,7 @@ class RunnerHandler(BaseHTTPRequestHandler):
             "job_id": job_id,
             "status": session.status,
             "iteration": session.iteration,
-            "max_iterations": session.max_iterations,
+            "max_turns": session.max_turns,
             "model": session.model,
             "result_text": session.result_text[:2000] if session.result_text else "",
         }

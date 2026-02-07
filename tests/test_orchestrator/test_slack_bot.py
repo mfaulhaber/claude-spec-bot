@@ -85,7 +85,7 @@ class TestFormatJobStatus:
             phase="RUNNING",
             model="claude-opus-4-20250514",
             agent_iteration=5,
-            max_iterations=200,
+            max_turns=200,
         )
         text = format_job_status(state)
         assert "RUNNING" in text

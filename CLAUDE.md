@@ -4,7 +4,7 @@
 
 This project is an autonomous Claude Code agent exposed over Slack. It has two components:
 
-1. **Runner** (`src/poc/`) — A Python agent running inside Docker. Receives goals from the orchestrator, calls the Claude API, executes tools (bash, file I/O, search, web search), and reports progress via HTTP callbacks. Listens on port 8000.
+1. **Runner** (`src/poc/`) — A Python agent running inside Docker. Receives goals from the orchestrator, wraps the Claude Agent SDK (`claude-agent-sdk`) which provides Claude Code's built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch), and reports progress via HTTP callbacks. Listens on port 8000.
 2. **Orchestrator** (`orchestrator_host/`) — A host-side Slack bot that connects to Slack via Socket Mode. Receives `!poc` commands, manages jobs, posts progress/approval messages, and bridges user interactions to the runner.
 
 ## Architecture
@@ -36,31 +36,34 @@ Slack (Socket Mode)
 ┌─────────────────────────────┐
 │  Runner (Docker :8000)      │
 │  src/poc/                   │
-│  - Agent loop: calls Claude │
-│    API, dispatches tools    │
-│  - Tools: bash, read_file,  │
-│    write_file, edit_file,   │
-│    list_files, search_files,│
-│    web_search (server-side) │
+│  - Wraps Claude Agent SDK   │
+│    (claude-agent-sdk)       │
+│  - SDK built-in tools: Bash,│
+│    Read, Write, Edit, Glob, │
+│    Grep, WebSearch, WebFetch│
 │  - POSTs events to callback │
 │    URL (host:8001)          │
 │  - Pauses on approval_needed│
 │    resumes on /approve POST │
-│  - Mounts:                  │
-│    /workspace = repo root   │
-│    /runner = state/logs     │
+│  - No host filesystem access│
+│  - Docker volumes only:     │
+│    /sandbox = working dir   │
+│    /runner  = internal state│
 └─────────────────────────────┘
 ```
 
 **Message flow**: Slack user sends `!poc run <task>` → Orchestrator creates job, POSTs to runner `/jobs/{id}/start` → Runner starts agent loop (Claude API + tool execution) → Runner POSTs events to orchestrator callback `:8001/events` → Orchestrator posts progress to Slack thread → When tool needs approval, runner pauses and orchestrator posts Block Kit buttons → User clicks Approve/Deny → Orchestrator edits the button message in place (replacing buttons with decision text) and POSTs to runner `/jobs/{id}/approve` → Agent continues or stops. If no approval is given within 10 minutes, the runner auto-denies the tool call and posts an `approval_timeout` event.
 
-## Execution Boundary
+## Execution Boundary & Container Isolation
 - The runner (`src/poc/`) runs inside Docker. Start it with `docker compose up -d`.
 - The orchestrator (`orchestrator_host/`) runs on the host. Start it with `python -m orchestrator_host.main`.
 - Do NOT run runner commands directly on the host.
-- Only mounted paths are:
-  - `/workspace` = repo root
-  - `/runner` = state/logs/artifacts (host-mounted `./runner`)
+- **The runner container must have zero access to the host filesystem.** All storage uses Docker named volumes:
+  - `/sandbox` (volume `sandbox`) — agent's writable working directory
+  - `/runner` (volume `runner_data`) — internal state, event logs, job data
+- Runner source code is baked into the image at build time (`COPY src/poc/ /app/src/poc/`).
+- The `runner/.env` file is read by Docker Compose at startup via `env_file:` — it is NOT mounted into the container.
+- Never mount host paths (bind mounts) into the runner container.
 - Never request mounting `$HOME`, `~/.ssh`, `SSH_AUTH_SOCK`, `/var/run/docker.sock`, or any credential directories.
 
 ## Networking
@@ -81,30 +84,22 @@ Slack (Socket Mode)
   - `SLACK_APP_TOKEN`
 - If keys are missing, set state to BLOCKED and ask concise questions.
 
-## State and Plan Files (must always be updated)
-- `runner/state.json` is the source of truth. Update it on every phase boundary and after meaningful outputs.
-- `runner/plan.md` should contain a human-readable checklist, assumptions, decisions, and commands used.
-- Logs must be written under `runner/logs/`
-- Reports/artifacts must be written under `runner/artifacts/`
-- Per-job state is stored at `runner/jobs/<job_id>/state.json` (managed by orchestrator)
-- Per-job conversation history is stored at `runner/jobs/<job_id>/conversation.json` (managed by runner)
-- Per-job events are logged at `runner/jobs/<job_id>/events.jsonl` (managed by runner)
+## State Management
+- **Orchestrator-side** (host filesystem): Per-job state at `runner/jobs/<job_id>/state.json` (managed by orchestrator via `state.py`)
+- **Runner-side** (Docker volume): Per-job events at `/runner/jobs/<job_id>/events.jsonl` (internal to container)
+- The orchestrator and runner do NOT share a filesystem. All communication is via HTTP.
 
 ## Required Project Layout
 - Docker:
-  - `docker-compose.yml` — Defines the `runner` service, port mapping (8000:8000), volume mounts, env
-  - `Dockerfile.poc` — Python 3.12-slim image with git/ripgrep, installs anthropic SDK, starts `python -m poc.handler`
-- Runner (Docker-side):
+  - `docker-compose.yml` — Defines the `runner` service, port mapping (8000:8000), Docker volumes, env
+  - `Dockerfile.poc` — Python 3.12-slim + Node.js 20 + git/ripgrep, installs claude-agent-sdk, copies runner source, runs as non-root `agent` user
+- Runner (Docker-side, source baked into image):
   - `src/poc/__init__.py`
   - `src/poc/handler.py` — HTTP API handler with multi-endpoint routing (port 8000)
-  - `src/poc/agent.py` — AgentSession class, core agent loop with approval workflow
-  - `src/poc/claude_client.py` — Anthropic SDK wrapper with retry and token tracking
-  - `src/poc/tools.py` — Tool schemas and executors (bash, file I/O, search, web search)
+  - `src/poc/agent.py` — AgentSession class, wraps Claude Agent SDK with async approval workflow via `can_use_tool` callback
+  - `src/poc/event_bridge.py` — Maps SDK message types (AssistantMessage, ResultMessage) and hook data to callback events
   - `src/poc/callback.py` — HTTP callback client for posting events to orchestrator
   - `runner/.env.example` (NOT `.env`)
-  - `runner/state.json`, `runner/plan.md`
-  - `runner/logs/`, `runner/artifacts/`
-  - `runner/jobs/` (per-job state, gitignored)
 - Orchestrator (host-side):
   - `orchestrator_host/__init__.py`
   - `orchestrator_host/main.py` — Entry point, loads .env, starts callback server + Socket Mode
@@ -118,7 +113,7 @@ Slack (Socket Mode)
   - `orchestrator_host/.env.example` (NOT `.env`)
 
 ## Package Layout
-- `src/poc/` — Runner package (runs inside Docker, discovered via `PYTHONPATH=/workspace/src`)
+- `src/poc/` — Runner package (copied into Docker image at `/app/src/poc/`, discovered via `PYTHONPATH=/app/src`)
 - `orchestrator_host/` — Orchestrator package (installed on host via `pip install -e ".[orchestrator]"`)
 - Both discovered by setuptools via `where = ["src", "."]` with `include = ["poc*", "orchestrator_host*"]`
 
@@ -138,7 +133,7 @@ Slack (Socket Mode)
 ## Verifying Changes
 - **Always run unit tests before committing**:
   - `source .venv/bin/activate && python -m pytest tests/ -v`
-- All 157+ tests must pass.
+- All 163+ tests must pass.
 - Networked tests are skipped automatically when API keys are absent.
 - **If any runner code changed** (`src/poc/`, `Dockerfile.poc`, `docker-compose.yml`):
   - Rebuild and restart the container: `docker compose up -d --build`
@@ -165,7 +160,7 @@ Slack (Socket Mode)
 - Test the runner health:
   - `curl -s http://localhost:8000/health`
 - Test the agent directly (no Slack needed):
-  - `curl -X POST http://localhost:8000/jobs/test-001/start -H "Content-Type: application/json" -d '{"goal": "List all Python files in the project", "callback_url": "http://host.docker.internal:8001/events"}'`
+  - `curl -X POST http://localhost:8000/jobs/test-001/start -H "Content-Type: application/json" -d '{"goal": "What is 2+2? Report the answer.", "callback_url": "http://host.docker.internal:8001/events"}'`
   - Check status: `curl -s http://localhost:8000/jobs/test-001/status`
 
 ## End-to-End Testing
@@ -183,13 +178,13 @@ Slack (Socket Mode)
    # {"status": "ok", "service": "poc-runner"}
    ```
 
-3. Verify the Claude client can handle a job — submit a read-only task that
+3. Verify the agent can handle a job — submit a simple task that
    uses only auto-approved tools. This confirms the API key is valid, the
-   Claude client works, and the agent loop completes without approval:
+   Claude Agent SDK works, and the agent loop completes without approval:
    ```bash
    curl -s -X POST http://localhost:8000/jobs/smoke-test/start \
      -H "Content-Type: application/json" \
-     -d '{"goal": "List all Python files in the project", "callback_url": ""}'
+     -d '{"goal": "What is 2+2? Report the answer.", "callback_url": ""}'
    ```
 
 4. Poll status until `"status": "completed"`:
@@ -229,12 +224,12 @@ Slack (Socket Mode)
 2. Ensure `orchestrator_host/.env` has `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`.
 3. Start the runner: `docker compose up -d --build`
 4. Start the orchestrator: `source .venv/bin/activate && python -m orchestrator_host.main`
-5. In Slack, type: `!poc run List all Python files`
+5. In Slack, type: `!poc run What is the weather in Seattle today?`
 6. The bot should:
    - Confirm the job was started
-   - Post thinking/progress updates
-   - Post tool call summaries (e.g., `:gear: list_files: *.py`)
-   - Complete with a summary message
+   - Post tool call progress (e.g., `:hourglass_flowing_sand: WebSearch: ...`)
+   - Update tool calls on completion (`:white_check_mark: WebSearch: ...`)
+   - Complete with a summary message and cost
 7. For tasks that involve writes or bash commands, the bot will post approval
    buttons. Click **Approve**, **Approve All**, or **Deny**, or reply in the
    thread with "yes"/"no".
@@ -248,7 +243,4 @@ Slack (Socket Mode)
    - The agent continues with a denial message in its conversation.
 
 ## If blocked
-When blocked, do:
-1) Set `runner/state.json.phase` to `BLOCKED`
-2) Add `blockers` with exact missing info
-3) Ask only 1-3 multiple-choice questions
+When blocked, ask only 1-3 concise multiple-choice questions to unblock.

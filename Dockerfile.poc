@@ -1,17 +1,33 @@
 FROM python:3.12-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl git ripgrep && \
+    apt-get install -y --no-install-recommends curl git ripgrep ca-certificates gnupg && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
+        gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | \
+        tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace
-
 # Install Python dependencies
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir anthropic httpx
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir claude-agent-sdk httpx
+
+# Copy runner source code
+COPY src/poc/ /app/src/poc/
+
+ENV PYTHONPATH=/app/src
 
 # Runner state dir is mounted at /runner
 RUN mkdir -p /runner/logs /runner/artifacts /runner/jobs
+
+# Create non-root user (SDK refuses bypassPermissions as root)
+RUN useradd -m -s /bin/bash agent && \
+    mkdir -p /sandbox && \
+    chown -R agent:agent /runner /sandbox
+USER agent
+
+WORKDIR /sandbox
 
 EXPOSE 8000
 

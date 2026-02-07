@@ -94,7 +94,7 @@ class TestStatusEndpoint:
         mock_session = MagicMock()
         mock_session.status = "running"
         mock_session.iteration = 5
-        mock_session.max_iterations = 200
+        mock_session.max_turns = 200
         mock_session.model = "claude-sonnet-4-5-20250929"
         mock_session.result_text = ""
         mock_session.pending_approval = None

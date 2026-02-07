@@ -46,7 +46,7 @@ class JobState:
     # Agent-mode fields
     model: str = "claude-sonnet-4-5-20250929"
     agent_iteration: int = 0
-    max_iterations: int = 200
+    max_turns: int = 200
     approved_tools: list[str] = field(default_factory=list)
     callback_url: str = ""
     input_tokens: int = 0
