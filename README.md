@@ -4,14 +4,15 @@ A containerized POC runner with LLM provider abstraction and a Slack-controlled 
 
 ## Components
 
-**POC Runner** (`src/poc/`) — CLI tool for sending prompts to LLM providers (Ollama, OpenAI, Anthropic) with a unified interface. Runs inside Docker.
+**POC Runner** (`src/poc/`) — A Python HTTP message handler running inside Docker. Receives messages from the orchestrator, processes them, and returns responses on port 8000.
 
-**Orchestrator** (`orchestrator_host/`) — Host-side Slack bot that lets users trigger and monitor the build/test pipeline from a Slack channel using `!poc` commands.
+**Orchestrator** (`orchestrator_host/`) — Host-side Slack bot that connects to Slack via Socket Mode, receives `!poc` commands from users, and forwards messages to the runner via HTTP POST.
 
 ## Quick Start
 
 ### Prerequisites
 
+- Python 3.12+
 - Docker Desktop with Compose v2
 - (Optional) Ollama running on the host
 - (Optional) OpenAI / Anthropic API keys
@@ -19,42 +20,46 @@ A containerized POC runner with LLM provider abstraction and a Slack-controlled 
 ### Setup
 
 ```bash
-# Copy and fill in secrets
+# Create a local venv and install dev + orchestrator dependencies
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,orchestrator]"
+
+# Copy and fill in runner secrets (optional, for LLM API keys)
 cp runner/.env.example runner/.env
 
-# Build the container
+# Build and start the runner container
 docker compose build
+docker compose up -d
+```
 
-# Install dependencies
-docker compose run --rm runner bash -lc "scripts/bootstrap.sh"
+### Verify the Runner
 
-# Verify environment
-docker compose run --rm runner bash -lc "scripts/doctor.sh"
+```bash
+# Health check
+curl -s http://localhost:8000
+# {"status": "ok", "service": "poc-runner"}
+
+# Send a test message
+curl -s -X POST http://localhost:8000 \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "test-123", "message": "hello world"}'
+# {"job_id": "test-123", "status": "processed", "reply": "..."}
 ```
 
 ### Run Tests
 
 ```bash
-docker compose run --rm runner bash -lc "scripts/test.sh"
+source .venv/bin/activate
+python -m pytest tests/ -v
 ```
 
 ### Run Linter
 
 ```bash
-docker compose run --rm runner bash -lc "scripts/lint.sh"
-```
-
-### Use the CLI
-
-```bash
-# Ollama (requires Ollama running on host)
-docker compose run --rm runner bash -lc "scripts/run.sh llm --backend ollama --model llama3.2 --prompt 'Hello'"
-
-# OpenAI (requires OPENAI_API_KEY in runner/.env)
-docker compose run --rm runner bash -lc "scripts/run.sh llm --backend openai --model gpt-4o-mini --prompt 'Hello'"
-
-# Anthropic (requires ANTHROPIC_API_KEY in runner/.env)
-docker compose run --rm runner bash -lc "scripts/run.sh llm --backend anthropic --model claude-haiku-4-5-20251001 --prompt 'Hello'"
+source .venv/bin/activate
+ruff check src/ tests/ orchestrator_host/
+ruff format --check src/ tests/ orchestrator_host/
 ```
 
 ## Slack Orchestrator
@@ -138,13 +143,13 @@ Verify by typing `!poc help` in the channel — the bot should respond.
 
 | Command | Description |
 |---|---|
-| `!poc run <goal>` | Start a new pipeline run (bootstrap, doctor, lint, test) |
+| `!poc run <message>` | Send a message to the runner and get a response |
 | `!poc status [job_id]` | Show status of a job (defaults to current) |
 | `!poc cancel [job_id]` | Cancel a running or queued job |
 | `!poc list` | List recent jobs |
 | `!poc help` | Show help message |
 
-Pipeline progress is reported in the Slack thread where the command was issued.
+Responses are posted in the Slack thread where the command was issued.
 
 ### Job State Machine
 
@@ -165,38 +170,31 @@ Per-job state is stored at `runner/jobs/<job_id>/state.json` with logs at `runne
 
 ```
 .
-├── docker-compose.yml          # Docker services (runner, runner_offline)
-├── Dockerfile.poc              # Python 3.12 container image
+├── docker-compose.yml          # Runner service, port 8000, volume mounts
+├── Dockerfile.poc              # Python 3.12-slim, starts poc.handler
 ├── pyproject.toml              # Project config, deps, entry points
-├── src/poc/                    # POC package (runs in Docker)
+├── src/poc/                    # Runner package (runs in Docker)
 │   ├── __init__.py
-│   ├── cli.py                  # Click CLI
-│   └── providers.py            # LLM provider abstraction
+│   └── handler.py              # HTTP message handler (port 8000)
 ├── orchestrator_host/          # Slack orchestrator (runs on host)
 │   ├── __init__.py
+│   ├── main.py                 # Entry point, loads .env, starts Socket Mode
+│   ├── slack_bot.py            # Slack Bolt app, !poc command handlers
+│   ├── docker_exec.py          # HTTP client to runner + Docker helpers
 │   ├── state.py                # Job state dataclasses, file I/O
-│   ├── docker_exec.py          # Docker Compose subprocess wrapper
 │   ├── jobs.py                 # Job queue, pipeline execution
-│   ├── slack_bot.py            # Slack Bolt app, command handlers
-│   └── main.py                 # Entry point
+│   └── .env.example            # Template for Slack tokens
 ├── tests/
-│   ├── test_providers.py       # Provider unit + integration tests
 │   └── test_orchestrator/      # Orchestrator unit tests
 │       ├── test_state.py
 │       ├── test_docker_exec.py
 │       ├── test_jobs.py
 │       └── test_slack_bot.py
-├── scripts/
-│   ├── bootstrap.sh            # Install deps into persistent venv
-│   ├── doctor.sh               # Connectivity and environment checks
-│   ├── lint.sh                 # ruff check + format
-│   ├── test.sh                 # pytest with report generation
-│   └── run.sh                  # CLI wrapper
-└── runner/                     # Mounted state directory
-    ├── state.json              # Global project state
-    ├── plan.md                 # Implementation plan and checklist
-    ├── .env.example            # Template for secrets
-    ├── logs/                   # Build/test logs
-    ├── artifacts/              # Reports and outputs
+└── runner/                     # Mounted state directory (Docker volume)
+    ├── .env.example            # Template for runner secrets
+    ├── state.json
+    ├── plan.md
+    ├── logs/
+    ├── artifacts/
     └── jobs/                   # Per-job state (gitignored)
 ```

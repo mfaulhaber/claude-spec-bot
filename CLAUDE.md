@@ -2,21 +2,54 @@
 
 ## Project Overview
 
-This project has two components:
+This project has two components that communicate over HTTP:
 
-1. **POC Runner** (`src/poc/`) — LLM provider abstraction with containerized build/test. Runs inside Docker.
-2. **Orchestrator** (`orchestrator_host/`) — Slack bot that triggers and monitors the POC pipeline via `!poc` commands. Runs on the host.
+1. **POC Runner** (`src/poc/`) — A Python HTTP message handler running inside Docker. Receives messages from the orchestrator, processes them, and returns responses. Starts automatically with the container on port 8000.
+2. **Orchestrator** (`orchestrator_host/`) — A host-side Slack bot that connects to Slack via Socket Mode. Receives `!poc` commands from users and forwards messages to the runner via HTTP POST.
+
+## Architecture
+
+```
+Slack (Socket Mode)
+    │
+    ▼
+┌──────────────────────────┐
+│  Orchestrator (host)     │
+│  orchestrator_host/      │
+│  - Slack Bolt app        │
+│  - Parses !poc commands  │
+│  - Manages job state     │
+│  - Loads tokens from     │
+│    orchestrator_host/.env│
+└──────────┬───────────────┘
+           │ HTTP POST (localhost:8000)
+           ▼
+┌──────────────────────────┐
+│  Runner (Docker)         │
+│  src/poc/handler.py      │
+│  - HTTP server on :8000  │
+│  - Receives JSON messages│
+│  - Returns JSON responses│
+│  - Mounts:               │
+│    /workspace = repo root│
+│    /runner = state/logs   │
+└──────────────────────────┘
+```
+
+**Message flow**: Slack user sends `!poc run <message>` → Orchestrator receives via Socket Mode → POSTs `{"job_id": "...", "message": "..."}` to `http://localhost:8000` → Runner processes and returns `{"job_id": "...", "status": "processed", "reply": "..."}` → Orchestrator posts reply back to Slack thread.
 
 ## Execution Boundary
-- Do NOT run shell commands on the host.
-- Run all commands via Docker Compose service `runner`.
+- The runner (`src/poc/`) runs inside Docker. Start it with `docker compose up -d`.
+- The orchestrator (`orchestrator_host/`) runs on the host. Start it with `python -m orchestrator_host.main`.
+- Do NOT run runner commands directly on the host.
 - Only mounted paths are:
   - `/workspace` = repo root
   - `/runner` = state/logs/artifacts (host-mounted `./runner`)
 - Never request mounting `$HOME`, `~/.ssh`, `SSH_AUTH_SOCK`, `/var/run/docker.sock`, or any credential directories.
-- **Exception**: The orchestrator (`orchestrator_host/`) runs on the host, not in Docker. It invokes Docker Compose via subprocess.
 
 ## Networking
+- The runner exposes port 8000 (mapped to host `localhost:8000`).
+- The orchestrator communicates with the runner via HTTP at `http://localhost:8000`.
 - Internet access is allowed for API calls.
 - Host Ollama is available at: `OLLAMA_BASE_URL=http://host.docker.internal:11434`
 - If Ollama is unreachable, instruct the user to ensure Ollama is listening on an interface reachable by Docker (often via `OLLAMA_HOST=0.0.0.0:11434` for `ollama serve`).
@@ -27,7 +60,7 @@ This project has two components:
   - `OPENAI_API_KEY`
   - `ANTHROPIC_API_KEY`
   - optionally `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`
-- Orchestrator tokens (host-side, not in `runner/.env`):
+- Use `orchestrator_host/.env` for (loaded automatically via python-dotenv):
   - `SLACK_BOT_TOKEN`
   - `SLACK_APP_TOKEN`
 - If keys are missing, set state to BLOCKED and ask concise questions.
@@ -41,31 +74,26 @@ This project has two components:
 
 ## Required Project Layout
 - Docker:
-  - `docker-compose.yml`
-  - `Dockerfile.poc`
-- Runner directory:
-  - `runner/state.json`
-  - `runner/plan.md`
-  - `runner/logs/`
-  - `runner/artifacts/`
-  - `runner/jobs/` (orchestrator job state, gitignored)
+  - `docker-compose.yml` — Defines the `runner` service, port mapping (8000:8000), volume mounts, env
+  - `Dockerfile.poc` — Python 3.12-slim image, starts `python -m poc.handler`
+- Runner (Docker-side):
+  - `src/poc/__init__.py`
+  - `src/poc/handler.py` — HTTP message handler (port 8000)
   - `runner/.env.example` (NOT `.env`)
-- Scripts:
-  - `scripts/bootstrap.sh`
-  - `scripts/doctor.sh`
-  - `scripts/lint.sh`
-  - `scripts/test.sh`
-  - `scripts/run.sh`
+  - `runner/state.json`, `runner/plan.md`
+  - `runner/logs/`, `runner/artifacts/`
+  - `runner/jobs/` (orchestrator job state, gitignored)
 - Orchestrator (host-side):
   - `orchestrator_host/__init__.py`
-  - `orchestrator_host/state.py`
-  - `orchestrator_host/docker_exec.py`
-  - `orchestrator_host/jobs.py`
-  - `orchestrator_host/slack_bot.py`
-  - `orchestrator_host/main.py`
+  - `orchestrator_host/main.py` — Entry point, loads .env, starts Socket Mode
+  - `orchestrator_host/slack_bot.py` — Slack Bolt app, `!poc` command handlers
+  - `orchestrator_host/docker_exec.py` — HTTP client to runner + Docker subprocess helpers
+  - `orchestrator_host/state.py` — Job state dataclasses, file I/O with locking
+  - `orchestrator_host/jobs.py` — Job queue, pipeline execution
+  - `orchestrator_host/.env.example` (NOT `.env`)
 
 ## Package Layout
-- `src/poc/` — POC package (installed inside Docker via `pip install -e ".[dev]"`)
+- `src/poc/` — Runner package (runs inside Docker, discovered via `PYTHONPATH=/workspace/src`)
 - `orchestrator_host/` — Orchestrator package (installed on host via `pip install -e ".[orchestrator]"`)
 - Both discovered by setuptools via `where = ["src", "."]` with `include = ["poc*", "orchestrator_host*"]`
 
@@ -76,22 +104,33 @@ This project has two components:
 - Lint covers `src/`, `tests/`, and `orchestrator_host/`.
 - Networked tests must be optional and skipped unless corresponding env vars are present.
 
-## Definition of Done (DoD)
-- `docker compose build` succeeds.
-- `docker compose run --rm runner bash -lc "scripts/bootstrap.sh"` succeeds.
-- `docker compose run --rm runner bash -lc "scripts/doctor.sh"` confirms:
-  - Python version
-  - Ollama reachable at `$OLLAMA_BASE_URL`
-  - outbound HTTPS works
-- `docker compose run --rm runner bash -lc "scripts/test.sh"` succeeds and writes logs + a short test report summary.
+## Verifying Changes
+- **Always run unit tests before committing**:
+  - `source .venv/bin/activate && python -m pytest tests/ -v`
+- All 52+ orchestrator tests must pass.
+- Networked tests are skipped automatically when API keys are absent.
+- **If any runner code changed** (`src/poc/`, `Dockerfile.poc`, `docker-compose.yml`):
+  - Rebuild and restart the container: `docker compose up -d --build`
+  - Verify the runner responds: `curl -s http://localhost:8000`
 
-## How to run commands (examples)
-- One-off:
-  - `docker compose run --rm runner bash -lc "<cmd>"`
-- Capture logs:
-  - `docker compose run --rm runner bash -lc "<cmd> |& tee /runner/logs/<name>.log"`
+## Definition of Done (DoD)
+- Unit tests pass: `python -m pytest tests/ -v`
+- `docker compose build` succeeds.
+- `docker compose up -d` starts the runner and it responds on port 8000.
+- `curl -s http://localhost:8000` returns `{"status": "ok", "service": "poc-runner"}`.
+
+## How to run
+- Run unit tests:
+  - `source .venv/bin/activate && python -m pytest tests/ -v`
+- Start the runner (Docker, persistent):
+  - `docker compose up -d` — starts the HTTP handler on port 8000
+  - `docker compose logs -f` — follow runner logs
+  - `docker compose down` — stop the runner
 - Start the Slack orchestrator (host-side):
-  - `SLACK_BOT_TOKEN=xoxb-... SLACK_APP_TOKEN=xapp-... python -m orchestrator_host.main`
+  - `source .venv/bin/activate && python -m orchestrator_host.main`
+  - Tokens are loaded automatically from `orchestrator_host/.env`
+- Test the runner directly:
+  - `curl -X POST http://localhost:8000 -H "Content-Type: application/json" -d '{"job_id":"test","message":"hello"}'`
 
 ## If blocked
 When blocked, do:
