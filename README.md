@@ -4,7 +4,7 @@ An autonomous Claude Code agent running inside Docker, controlled via Slack. Use
 
 ## Components
 
-**POC Runner** (`src/poc/`) — An autonomous agent running inside Docker. Calls the Claude API directly, executes tools (bash, file I/O, search), and reports progress via HTTP callbacks on port 8000.
+**POC Runner** (`src/poc/`) — An autonomous agent running inside Docker. Calls the Claude API directly, executes tools (bash, file I/O, search, web search), and reports progress via HTTP callbacks on port 8000.
 
 **Orchestrator** (`orchestrator_host/`) — Host-side Slack bot that connects to Slack via Socket Mode, receives `!poc` commands, dispatches jobs to the runner, and relays progress/approval interactions back to Slack threads.
 

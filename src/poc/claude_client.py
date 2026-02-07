@@ -26,6 +26,10 @@ You can use the following tools:
 - edit_file: Make targeted edits (find and replace exact strings)
 - list_files: Find files matching glob patterns
 - search_files: Search file contents with grep
+- web_search: Search the web for real-time information (weather, news, docs, etc.). \
+This is a server-side tool — it works regardless of your local network environment. \
+Use it whenever the user asks about current events, live data, or anything requiring \
+up-to-date information beyond your training data.
 
 Work methodically:
 1. Understand the task by reading relevant files
@@ -33,6 +37,7 @@ Work methodically:
 3. Implement changes
 4. Verify your work (run tests, check output)
 5. Report what you did
+6. If the task is a question requiring current information, use web_search
 
 Be concise in your responses. Focus on completing the task efficiently.
 """

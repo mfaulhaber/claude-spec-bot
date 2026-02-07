@@ -4,7 +4,7 @@
 
 This project is an autonomous Claude Code agent exposed over Slack. It has two components:
 
-1. **Runner** (`src/poc/`) — A Python agent running inside Docker. Receives goals from the orchestrator, calls the Claude API, executes tools (bash, file I/O, search), and reports progress via HTTP callbacks. Listens on port 8000.
+1. **Runner** (`src/poc/`) — A Python agent running inside Docker. Receives goals from the orchestrator, calls the Claude API, executes tools (bash, file I/O, search, web search), and reports progress via HTTP callbacks. Listens on port 8000.
 2. **Orchestrator** (`orchestrator_host/`) — A host-side Slack bot that connects to Slack via Socket Mode. Receives `!poc` commands, manages jobs, posts progress/approval messages, and bridges user interactions to the runner.
 
 ## Architecture
@@ -40,7 +40,8 @@ Slack (Socket Mode)
 │    API, dispatches tools    │
 │  - Tools: bash, read_file,  │
 │    write_file, edit_file,   │
-│    list_files, search_files │
+│    list_files, search_files,│
+│    web_search (server-side) │
 │  - POSTs events to callback │
 │    URL (host:8001)          │
 │  - Pauses on approval_needed│
@@ -98,7 +99,7 @@ Slack (Socket Mode)
   - `src/poc/handler.py` — HTTP API handler with multi-endpoint routing (port 8000)
   - `src/poc/agent.py` — AgentSession class, core agent loop with approval workflow
   - `src/poc/claude_client.py` — Anthropic SDK wrapper with retry and token tracking
-  - `src/poc/tools.py` — Tool schemas and executors (bash, file I/O, search)
+  - `src/poc/tools.py` — Tool schemas and executors (bash, file I/O, search, web search)
   - `src/poc/callback.py` — HTTP callback client for posting events to orchestrator
   - `runner/.env.example` (NOT `.env`)
   - `runner/state.json`, `runner/plan.md`
@@ -128,10 +129,16 @@ Slack (Socket Mode)
 - Lint covers `src/`, `tests/`, and `orchestrator_host/`.
 - Networked tests must be optional and skipped unless corresponding env vars are present.
 
+## Keeping Documentation In Sync
+- When adding, removing, or renaming tools, features, or components, update **both** `CLAUDE.md` and `README.md` to reflect the change. This includes tool lists, architecture diagrams, project structure trees, and component descriptions.
+- When changing test counts (adding/removing test files or test cases), update any hard-coded test count references (e.g. "All 151+ tests must pass").
+- When adding new runner endpoints, env vars, or config, update the relevant sections in both files.
+- Treat documentation drift as a bug — if you changed behavior, update the docs in the same change.
+
 ## Verifying Changes
 - **Always run unit tests before committing**:
   - `source .venv/bin/activate && python -m pytest tests/ -v`
-- All 151+ tests must pass.
+- All 157+ tests must pass.
 - Networked tests are skipped automatically when API keys are absent.
 - **If any runner code changed** (`src/poc/`, `Dockerfile.poc`, `docker-compose.yml`):
   - Rebuild and restart the container: `docker compose up -d --build`

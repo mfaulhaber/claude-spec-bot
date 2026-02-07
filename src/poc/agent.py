@@ -10,7 +10,7 @@ from pathlib import Path
 
 from poc.callback import CallbackClient, NullCallbackClient
 from poc.claude_client import ClaudeClient
-from poc.tools import TOOL_SCHEMAS, execute_tool
+from poc.tools import TOOL_SCHEMAS, WEB_SEARCH_TOOL, execute_tool
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +21,7 @@ DEFAULT_PERMISSIONS: dict[str, str] = {
     "read_file": "auto",
     "list_files": "auto",
     "search_files": "auto",
+    "web_search": "auto",
     "bash": "ask_once",
     "write_file": "ask_once",
     "edit_file": "ask_once",
@@ -130,7 +131,7 @@ class AgentSession:
 
                 response = self._claude.create_message(
                     messages=self.conversation,
-                    tools=TOOL_SCHEMAS,
+                    tools=TOOL_SCHEMAS + [WEB_SEARCH_TOOL],
                 )
 
                 # Build assistant turn content
@@ -152,6 +153,25 @@ class AgentSession:
                             "id": block.id,
                             "name": block.name,
                             "input": block.input,
+                        })
+                    elif block.type == "server_tool_use":
+                        assistant_content.append(block.model_dump())
+                        self._callback.post_event("tool_call", {
+                            "tool_name": block.name,
+                            "tool_input": _summarize_input(block.name, block.input),
+                            "tool_use_id": block.id,
+                        })
+                    elif block.type == "web_search_tool_result":
+                        assistant_content.append(block.model_dump())
+                        content = getattr(block, "content", [])
+                        preview = ""
+                        if content:
+                            titles = [r.title for r in content if hasattr(r, "title")]
+                            preview = f"Found {len(content)} results: {', '.join(titles[:3])}"
+                        self._callback.post_event("tool_result", {
+                            "tool_name": "web_search",
+                            "tool_use_id": getattr(block, "tool_use_id", ""),
+                            "result_preview": preview[:500],
                         })
 
                 self.conversation.append({"role": "assistant", "content": assistant_content})
@@ -320,4 +340,6 @@ def _summarize_input(tool_name: str, tool_input: dict) -> str:
         return tool_input.get("pattern", "")
     if tool_name == "search_files":
         return tool_input.get("pattern", "")
+    if tool_name == "web_search":
+        return tool_input.get("query", "")
     return json.dumps(tool_input)[:200]

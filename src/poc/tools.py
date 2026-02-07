@@ -196,6 +196,9 @@ TOOL_SCHEMAS = [
     },
 ]
 
+# Server-side tool (Anthropic handles execution; no client-side executor needed)
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
+
 # ---------------------------------------------------------------------------
 # Tool executors
 # ---------------------------------------------------------------------------

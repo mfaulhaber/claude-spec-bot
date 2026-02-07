@@ -9,6 +9,7 @@ import pytest
 
 from poc.tools import (
     TOOL_SCHEMAS,
+    WEB_SEARCH_TOOL,
     _resolve_path,
     _truncate,
     execute_bash,
@@ -225,3 +226,11 @@ class TestExecuteTool:
             assert "description" in schema
             assert "input_schema" in schema
             assert schema["input_schema"]["type"] == "object"
+
+
+class TestWebSearchTool:
+    def test_web_search_tool_schema(self):
+        assert WEB_SEARCH_TOOL["type"] == "web_search_20250305"
+        assert WEB_SEARCH_TOOL["name"] == "web_search"
+        # Server tools don't have input_schema
+        assert "input_schema" not in WEB_SEARCH_TOOL

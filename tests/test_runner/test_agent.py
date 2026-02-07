@@ -323,6 +323,68 @@ class TestAgentSession:
         assert session.conversation[-1]["content"] == "additional instructions"
 
 
+    @patch("poc.agent.ClaudeClient")
+    def test_server_tool_use_web_search(self, mock_client_cls):
+        """Agent handles server-side web search blocks without client execution."""
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+
+        # Build a response containing server_tool_use + web_search_tool_result + text
+        server_tool_block = MagicMock()
+        server_tool_block.type = "server_tool_use"
+        server_tool_block.id = "stu-1"
+        server_tool_block.name = "web_search"
+        server_tool_block.input = {"query": "weather in Seattle"}
+        server_tool_block.model_dump = MagicMock(return_value={
+            "type": "server_tool_use",
+            "id": "stu-1",
+            "name": "web_search",
+            "input": {"query": "weather in Seattle"},
+        })
+
+        search_result_item = MagicMock()
+        search_result_item.title = "Seattle Weather"
+
+        search_result_block = MagicMock()
+        search_result_block.type = "web_search_tool_result"
+        search_result_block.tool_use_id = "stu-1"
+        search_result_block.content = [search_result_item]
+        search_result_block.model_dump = MagicMock(return_value={
+            "type": "web_search_tool_result",
+            "tool_use_id": "stu-1",
+            "content": [{"type": "web_search_result", "title": "Seattle Weather", "url": "https://example.com"}],
+        })
+
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "The weather in Seattle is rainy."
+
+        response = MagicMock()
+        response.content = [server_tool_block, search_result_block, text_block]
+        response.stop_reason = "end_turn"
+        response.usage = MagicMock(input_tokens=200, output_tokens=100)
+
+        mock_client.create_message.return_value = response
+        mock_client.usage = MagicMock(input_tokens=200, output_tokens=100)
+
+        session = self._make_session()
+        session.start()
+        session._thread.join(timeout=5)
+
+        assert session.status == "completed"
+        assert "rainy" in session.result_text
+
+        # Verify assistant content includes the server tool blocks
+        assistant_msg = session.conversation[1]  # index 0 = user goal, 1 = assistant
+        assert assistant_msg["role"] == "assistant"
+        content_types = [c["type"] for c in assistant_msg["content"]]
+        assert "server_tool_use" in content_types
+        assert "web_search_tool_result" in content_types
+
+        # No tool_result user message should follow (no client-side execution)
+        assert len(session.conversation) == 2  # user + assistant only
+
+
 class TestSummarizeInput:
     def test_bash(self):
         assert _summarize_input("bash", {"command": "echo hi"}) == "echo hi"
@@ -332,6 +394,10 @@ class TestSummarizeInput:
 
     def test_list_files(self):
         assert _summarize_input("list_files", {"pattern": "*.py"}) == "*.py"
+
+    def test_web_search(self):
+        result = _summarize_input("web_search", {"query": "weather in Seattle"})
+        assert result == "weather in Seattle"
 
     def test_long_command_truncated(self):
         cmd = "x" * 300
