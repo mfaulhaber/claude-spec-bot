@@ -53,6 +53,11 @@ class TestJobState:
         j.set_phase("WAITING_APPROVAL")
         assert j.phase == "WAITING_APPROVAL"
 
+    def test_set_phase_waiting_input(self):
+        j = JobState(job_id="test-123", goal="g")
+        j.set_phase("WAITING_INPUT")
+        assert j.phase == "WAITING_INPUT"
+
     def test_set_phase_invalid(self):
         j = JobState(job_id="test-123", goal="g")
         with pytest.raises(ValueError, match="Invalid phase"):

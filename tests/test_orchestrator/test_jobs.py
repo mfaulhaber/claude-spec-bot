@@ -147,6 +147,58 @@ class TestJobQueue:
         assert mock_start.call_count == 2
 
 
+class TestEndSession:
+    @patch("orchestrator_host.jobs.start_agent_job")
+    @patch("orchestrator_host.jobs.end_agent_job")
+    def test_end_session(self, mock_end, mock_start, tmp_path, monkeypatch):
+        monkeypatch.setattr("orchestrator_host.state.JOBS_DIR", tmp_path / "jobs")
+        mock_start.return_value = {"status": "started"}
+        mock_end.return_value = {"status": "end_requested"}
+
+        callback = MagicMock()
+        queue = JobQueue(callback=callback)
+
+        started_event = threading.Event()
+        callback.on_job_started.side_effect = lambda s: started_event.set()
+
+        job = create_job(goal="persistent task")
+        queue.enqueue(job.job_id)
+        assert started_event.wait(timeout=10)
+
+        queue.end_session(job.job_id)
+
+        final = load_state(job.job_id)
+        assert final.phase == "DONE"
+        mock_end.assert_called_once_with(job.job_id)
+        callback.on_job_done.assert_called_once()
+        assert queue.current_job_id is None
+
+
+class TestHasActiveSession:
+    @patch("orchestrator_host.jobs.start_agent_job")
+    def test_no_active_session(self, mock_start, tmp_path, monkeypatch):
+        monkeypatch.setattr("orchestrator_host.state.JOBS_DIR", tmp_path / "jobs")
+        queue = JobQueue()
+        assert not queue.has_active_session()
+
+    @patch("orchestrator_host.jobs.start_agent_job")
+    def test_active_session(self, mock_start, tmp_path, monkeypatch):
+        monkeypatch.setattr("orchestrator_host.state.JOBS_DIR", tmp_path / "jobs")
+        mock_start.return_value = {"status": "started"}
+
+        callback = MagicMock()
+        queue = JobQueue(callback=callback)
+
+        started_event = threading.Event()
+        callback.on_job_started.side_effect = lambda s: started_event.set()
+
+        job = create_job(goal="active task")
+        queue.enqueue(job.job_id)
+        assert started_event.wait(timeout=10)
+
+        assert queue.has_active_session()
+
+
 class TestRecoverStaleJobs:
     def test_recovers_running_job(self, tmp_path, monkeypatch):
         monkeypatch.setattr("orchestrator_host.state.JOBS_DIR", tmp_path / "jobs")
@@ -169,6 +221,17 @@ class TestRecoverStaleJobs:
         assert recovered == ["stale-2"]
 
         final = load_state("stale-2")
+        assert final.phase == "FAILED"
+
+    def test_recovers_waiting_input_job(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("orchestrator_host.state.JOBS_DIR", tmp_path / "jobs")
+        state = JobState(job_id="stale-3", goal="stale", phase="WAITING_INPUT")
+        save_state(state)
+
+        recovered = recover_stale_jobs()
+        assert recovered == ["stale-3"]
+
+        final = load_state("stale-3")
         assert final.phase == "FAILED"
 
     def test_ignores_done_jobs(self, tmp_path, monkeypatch):

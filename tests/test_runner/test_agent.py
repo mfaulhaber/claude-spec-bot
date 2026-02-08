@@ -166,7 +166,7 @@ class TestCanUseTool:
 
 
 class TestAgentSessionSync:
-    """Test sync methods (approve, deny, cancel, add_message)."""
+    """Test sync methods (approve, deny, cancel, end, add_message)."""
 
     def test_approve_matching(self):
         session = _make_session()
@@ -245,10 +245,48 @@ class TestAgentSessionSync:
 
         session._loop.close()
 
+    def test_cancel_signals_message_event(self):
+        session = _make_session()
+        session._loop = asyncio.new_event_loop()
+        session._message_event = session._loop.run_until_complete(
+            _create_async_event(session._loop)
+        )
+        session.cancel()
+        assert session._cancel_requested
+        session._loop.close()
+
+    def test_end(self):
+        session = _make_session()
+        session._loop = asyncio.new_event_loop()
+        session._message_event = session._loop.run_until_complete(
+            _create_async_event(session._loop)
+        )
+        session._approval_event = session._loop.run_until_complete(
+            _create_async_event(session._loop)
+        )
+        session.end()
+        assert session._end_requested
+        session._loop.close()
+
+    def test_end_without_loop(self):
+        session = _make_session()
+        session.end()
+        assert session._end_requested
+
     def test_add_message(self):
         session = _make_session()
         session.add_message("do something else")
         assert session._queued_messages == ["do something else"]
+
+    def test_add_message_signals_message_event(self):
+        session = _make_session()
+        session._loop = asyncio.new_event_loop()
+        session._message_event = session._loop.run_until_complete(
+            _create_async_event(session._loop)
+        )
+        session.add_message("follow up")
+        assert session._queued_messages == ["follow up"]
+        session._loop.close()
 
 
 class _AsyncIterFromGen:
@@ -282,8 +320,8 @@ class TestAgentSessionIntegration:
     """Integration tests using mocked SDK client."""
 
     @patch("poc.agent.ClaudeSDKClient")
-    def test_simple_completion(self, mock_sdk_cls):
-        """Agent processes messages and completes."""
+    def test_simple_session_waits_for_input(self, mock_sdk_cls):
+        """Agent processes messages, then enters waiting_input state."""
         result_msg = _make_result_message("Here are the Python files.")
 
         async def fake_messages():
@@ -294,14 +332,22 @@ class TestAgentSessionIntegration:
 
         session = _make_session()
         session.start()
-        session._thread.join(timeout=10)
-
-        assert session.status == "completed"
+        # Wait for agent to reach waiting_input
+        for _ in range(100):
+            if session.status == "waiting_input":
+                break
+            time.sleep(0.1)
+        assert session.status == "waiting_input"
         assert session.result_text == "Here are the Python files."
+
+        # End the session so the thread can exit
+        session.end()
+        session._thread.join(timeout=10)
+        assert session.status == "completed"
 
     @patch("poc.agent.ClaudeSDKClient")
     def test_error_completion(self, mock_sdk_cls):
-        """Agent handles error result."""
+        """Agent handles error result and exits immediately."""
         result_msg = _make_result_message("API Error", is_error=True)
 
         async def fake_messages():
@@ -354,7 +400,7 @@ class TestAgentSessionIntegration:
 
     @patch("poc.agent.ClaudeSDKClient")
     def test_callback_events_emitted(self, mock_sdk_cls):
-        """Verify callback events are emitted for messages."""
+        """Verify callback events are emitted for persistent session."""
         result_msg = _make_result_message("Done.")
 
         async def fake_messages():
@@ -365,11 +411,22 @@ class TestAgentSessionIntegration:
 
         session = _make_session()
         session.start()
-        session._thread.join(timeout=10)
+        # Wait for waiting_input
+        for _ in range(100):
+            if session.status == "waiting_input":
+                break
+            time.sleep(0.1)
 
         event_types = [e["event_type"] for e in session._callback.events]
         assert "progress" in event_types  # From "Agent started" + text block
-        assert "completed" in event_types
+        assert "assistant_response" in event_types
+        assert "waiting_input" in event_types
+
+        session.end()
+        session._thread.join(timeout=10)
+
+        event_types = [e["event_type"] for e in session._callback.events]
+        assert "session_ended" in event_types
 
     @patch("poc.agent.ClaudeSDKClient")
     def test_iteration_count(self, mock_sdk_cls):
@@ -385,9 +442,145 @@ class TestAgentSessionIntegration:
 
         session = _make_session()
         session.start()
-        session._thread.join(timeout=10)
+        # Wait for waiting_input
+        for _ in range(100):
+            if session.status == "waiting_input":
+                break
+            time.sleep(0.1)
 
         assert session.iteration == 3
+
+        session.end()
+        session._thread.join(timeout=10)
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_persistent_follow_up(self, mock_sdk_cls):
+        """Agent processes follow-up message after first response."""
+        result1 = _make_result_message("First response.")
+        result2 = _make_result_message("Second response.")
+
+        async def fake_messages():
+            yield _make_assistant_message([TextBlock(text="Working...")])
+            yield result1
+            # After client.query() for follow-up, yield more messages
+            yield _make_assistant_message([TextBlock(text="Follow up...")])
+            yield result2
+
+        mock_client = _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
+        session.start()
+
+        # Wait for waiting_input
+        for _ in range(100):
+            if session.status == "waiting_input":
+                break
+            time.sleep(0.1)
+        assert session.status == "waiting_input"
+        assert session.result_text == "First response."
+
+        # Send follow-up message
+        session.add_message("Tell me more")
+
+        # Wait for second waiting_input
+        for _ in range(100):
+            if session.result_text == "Second response.":
+                break
+            time.sleep(0.1)
+
+        # Wait for waiting_input again
+        for _ in range(100):
+            if session.status == "waiting_input":
+                break
+            time.sleep(0.1)
+        assert session.status == "waiting_input"
+        assert session.result_text == "Second response."
+
+        # client.query should have been called twice (initial + follow-up)
+        assert mock_client.query.call_count == 2
+
+        session.end()
+        session._thread.join(timeout=10)
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_message_queued_while_processing(self, mock_sdk_cls):
+        """Messages sent while agent is processing are picked up immediately."""
+        result1 = _make_result_message("First.")
+        result2 = _make_result_message("Second.")
+
+        async def fake_messages():
+            yield _make_assistant_message([TextBlock(text="Working...")])
+            yield result1
+            yield _make_assistant_message([TextBlock(text="On follow-up...")])
+            yield result2
+
+        _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
+        # Pre-queue a message before starting
+        session.add_message("queued follow-up")
+        session.start()
+
+        # The agent should process the initial goal, then immediately pick up
+        # the queued message without going to waiting_input
+        for _ in range(100):
+            if session.result_text == "Second.":
+                break
+            time.sleep(0.1)
+
+        for _ in range(100):
+            if session.status == "waiting_input":
+                break
+            time.sleep(0.1)
+        assert session.status == "waiting_input"
+
+        session.end()
+        session._thread.join(timeout=10)
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_end_while_processing(self, mock_sdk_cls):
+        """End request while agent is processing terminates cleanly."""
+
+        async def fake_messages():
+            yield _make_assistant_message([TextBlock(text="Working...")])
+            # Simulate long processing
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+            yield _make_result_message()
+
+        _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
+        session.start()
+        time.sleep(0.3)
+        session.end()
+        session._thread.join(timeout=10)
+
+        assert session.status == "completed"
+
+    @patch("poc.agent.ClaudeSDKClient")
+    def test_cancel_while_waiting_input(self, mock_sdk_cls):
+        """Cancel while waiting for input terminates session."""
+        result_msg = _make_result_message("Done.")
+
+        async def fake_messages():
+            yield result_msg
+
+        _setup_mock_client(mock_sdk_cls, fake_messages)
+
+        session = _make_session()
+        session.start()
+
+        for _ in range(100):
+            if session.status == "waiting_input":
+                break
+            time.sleep(0.1)
+        assert session.status == "waiting_input"
+
+        session.cancel()
+        session._thread.join(timeout=10)
+
+        assert session.status == "cancelled"
 
 
 class TestApprovalRequiredTools:

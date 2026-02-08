@@ -75,13 +75,16 @@ class AgentSession:
     approved_tools: set[str] = field(default_factory=set)
     pending_approval: dict | None = field(default=None, repr=False)
     iteration: int = 0
-    status: str = "pending"  # pending | running | waiting_approval | completed | failed | cancelled
+    # pending | running | waiting_approval | waiting_input | completed | failed | cancelled
+    status: str = "pending"
     result_text: str = ""
     # --- async internals ---
     _loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
     _approval_event: asyncio.Event | None = field(default=None, repr=False)
+    _message_event: asyncio.Event | None = field(default=None, repr=False)
     _approval_granted: bool = field(default=False, repr=False)
     _cancel_requested: bool = field(default=False, repr=False)
+    _end_requested: bool = field(default=False, repr=False)
     _callback: CallbackClient | NullCallbackClient = field(
         default_factory=NullCallbackClient, repr=False
     )
@@ -122,6 +125,16 @@ class AgentSession:
     def add_message(self, message: str) -> None:
         """Queue a follow-up message to send after the current response completes."""
         self._queued_messages.append(message)
+        if self._loop and self._message_event:
+            self._loop.call_soon_threadsafe(self._message_event.set)
+
+    def end(self) -> None:
+        """Request graceful end of the persistent session."""
+        self._end_requested = True
+        if self._loop and self._message_event:
+            self._loop.call_soon_threadsafe(self._message_event.set)
+        if self._loop and self._approval_event:
+            self._loop.call_soon_threadsafe(self._approval_event.set)
 
     def cancel(self) -> None:
         """Request cancellation of the agent loop."""
@@ -130,6 +143,8 @@ class AgentSession:
             self._approval_granted = False
             if self._loop and self._approval_event:
                 self._loop.call_soon_threadsafe(self._approval_event.set)
+        if self._loop and self._message_event:
+            self._loop.call_soon_threadsafe(self._message_event.set)
 
     # ------------------------------------------------------------------
     # Internal: background thread + async agent loop
@@ -145,8 +160,9 @@ class AgentSession:
             self._loop.close()
 
     async def _run_agent(self) -> None:
-        """Main agent loop — delegates to the Claude Agent SDK."""
+        """Main agent loop — persistent session that waits for follow-up messages."""
         self._approval_event = asyncio.Event()
+        self._message_event = asyncio.Event()
         self._callback.post_event("progress", {"message": "Agent started", "iteration": 0})
 
         try:
@@ -176,31 +192,76 @@ class AgentSession:
                         })
                         return
 
+                    if self._end_requested:
+                        await client.interrupt()
+                        self.status = "completed"
+                        self._callback.post_event("session_ended", {
+                            "message": "Session ended by user",
+                        })
+                        return
+
                     if isinstance(message, AssistantMessage):
                         self.iteration += 1
                         events = event_bridge.map_assistant_message(message)
                         for ev in events:
                             self._callback.post_event(ev["event_type"], ev["data"])
                     elif isinstance(message, ResultMessage):
-                        ev = event_bridge.map_result_message(message)
-                        self._callback.post_event(ev["event_type"], ev["data"])
                         if message.is_error:
+                            ev = event_bridge.map_result_message(message)
+                            self._callback.post_event(ev["event_type"], ev["data"])
                             self.status = "failed"
                             self.result_text = message.result or "Unknown error"
-                        else:
-                            self.status = "completed"
-                            self.result_text = (message.result or "")[:2000]
+                            return
 
-                        # Send queued follow-up messages
-                        if self._queued_messages and not message.is_error:
-                            msg = self._queued_messages.pop(0)
-                            await client.query(msg)
+                        self.result_text = (message.result or "")[:2000]
+                        self._callback.post_event("assistant_response", {
+                            "message": self.result_text,
+                            "num_turns": message.num_turns,
+                            "duration_ms": message.duration_ms,
+                            "total_cost_usd": message.total_cost_usd,
+                        })
+
+                        # Check for queued messages first (sent while processing)
+                        if self._queued_messages:
+                            next_msg = self._queued_messages.pop(0)
+                        else:
+                            self.status = "waiting_input"
+                            self._callback.post_event("waiting_input", {})
+                            next_msg = await self._wait_for_message()
+                            if next_msg is None:
+                                if self._cancel_requested:
+                                    self.status = "cancelled"
+                                    self._callback.post_event("completed", {
+                                        "status": "cancelled",
+                                        "message": "Agent cancelled by user",
+                                    })
+                                else:
+                                    self.status = "completed"
+                                    self._callback.post_event("session_ended", {
+                                        "message": "Session ended by user",
+                                    })
+                                return
+
+                        self.status = "running"
+                        await client.query(next_msg)
 
         except Exception as exc:
             log.exception("Agent loop failed for job %s", self.job_id)
             self.status = "failed"
             self.result_text = str(exc)
             self._callback.post_event("failed", {"error": str(exc)})
+
+    async def _wait_for_message(self) -> str | None:
+        """Block until a message arrives or end/cancel is requested."""
+        while not self._queued_messages and not self._end_requested and not self._cancel_requested:
+            self._message_event.clear()
+            try:
+                await asyncio.wait_for(self._message_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+        if self._end_requested or self._cancel_requested:
+            return None
+        return self._queued_messages.pop(0)
 
     async def _can_use_tool(
         self,

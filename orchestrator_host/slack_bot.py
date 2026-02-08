@@ -65,11 +65,14 @@ HELP_TEXT = """\
 *POC Agent Commands*
 
 `!poc run [--model opus|sonnet] <task>` — Start the agent with a task
+`!poc exit` — End the current persistent session
 `!poc status [job_id]` — Show agent status
 `!poc cancel [job_id]` — Cancel a running agent
 `!poc list` — List recent jobs
 `!poc help` — Show this help message
 
+The agent session stays alive after each response. Send follow-up messages \
+in the thread to continue the conversation. Use `!poc exit` to end the session.
 The agent will request approval for bash commands and file writes.
 Reply "yes"/"approve" or "no"/"deny" in the thread, or use the buttons.
 """
@@ -120,6 +123,7 @@ def format_job_status(state: JobState) -> str:
         "QUEUED": ":hourglass:",
         "RUNNING": ":gear:",
         "WAITING_APPROVAL": ":lock:",
+        "WAITING_INPUT": ":white_circle:",
         "DONE": ":white_check_mark:",
         "FAILED": ":x:",
         "CANCELLED": ":stop_sign:",
@@ -178,7 +182,35 @@ def create_slack_app(
         if action == "help" or action == "":
             say(text=HELP_TEXT, thread_ts=thread_ts)
 
+        elif action == "exit":
+            job_id = queue.current_job_id
+            if not job_id:
+                say(text="No active session to exit.", thread_ts=thread_ts)
+                return
+            queue.end_session(job_id)
+            say(text=":wave: Session ending...", thread_ts=thread_ts)
+
         elif action == "run":
+            if queue.has_active_session():
+                # If the session is waiting for input, forward as a follow-up
+                current_id = queue.current_job_id
+                if current_id:
+                    try:
+                        current_state = load_state(current_id)
+                        if current_state.phase == "WAITING_INPUT":
+                            _, follow_up = _parse_model_flag(args)
+                            follow_up = follow_up or args
+                            if follow_up:
+                                send_message(current_id, follow_up)
+                                return
+                    except Exception:
+                        pass
+                say(
+                    text=":x: A session is already active. Use `!poc exit` to end it first.",
+                    thread_ts=thread_ts,
+                )
+                return
+
             model, goal = _parse_model_flag(args)
             goal = goal or "Complete the task"
 

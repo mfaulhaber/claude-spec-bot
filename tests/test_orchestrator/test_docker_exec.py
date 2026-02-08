@@ -10,6 +10,7 @@ from unittest.mock import patch
 from orchestrator_host.docker_exec import (
     cancel_agent_job,
     check_runner_health,
+    end_agent_job,
     get_agent_status,
     send_approval,
     send_message,
@@ -139,6 +140,23 @@ class TestCheckRunnerHealth:
         assert result["status"] == "ok"
         req = _MockRunnerHandler.requests[0]
         assert req["path"] == "/health"
+        server.server_close()
+
+
+class TestEndAgentJob:
+    def test_posts_end(self):
+        _MockRunnerHandler.requests.clear()
+        server = HTTPServer(("127.0.0.1", 0), _MockRunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+
+        with patch("orchestrator_host.docker_exec.RUNNER_URL", f"http://127.0.0.1:{port}"):
+            result = end_agent_job("job-1")
+
+        assert result["status"] == "ok"
+        req = _MockRunnerHandler.requests[0]
+        assert req["path"] == "/jobs/job-1/end"
         server.server_close()
 
 

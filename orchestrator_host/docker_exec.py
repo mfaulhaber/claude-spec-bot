@@ -60,6 +60,11 @@ def cancel_agent_job(job_id: str, *, timeout: int = 10) -> dict:
     return _post(f"/jobs/{job_id}/cancel", {}, timeout=timeout)
 
 
+def end_agent_job(job_id: str, *, timeout: int = 10) -> dict:
+    """Gracefully end a persistent agent session. POSTs to /jobs/{job_id}/end."""
+    return _post(f"/jobs/{job_id}/end", {}, timeout=timeout)
+
+
 def get_agent_status(job_id: str, *, timeout: int = 10) -> dict:
     """Get agent session status. GETs /jobs/{job_id}/status."""
     return _get(f"/jobs/{job_id}/status", timeout=timeout)

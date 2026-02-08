@@ -31,6 +31,7 @@ Slack (Socket Mode)
            │  /jobs/{id}/approve
            │  /jobs/{id}/message
            │  /jobs/{id}/cancel
+           │  /jobs/{id}/end
            │  /jobs/{id}/status
            ▼
 ┌─────────────────────────────┐
@@ -53,6 +54,8 @@ Slack (Socket Mode)
 ```
 
 **Message flow**: Slack user sends `!poc run <task>` → Orchestrator creates job, POSTs to runner `/jobs/{id}/start` → Runner starts agent loop (Claude API + tool execution) → Runner POSTs events to orchestrator callback `:8001/events` → Orchestrator posts progress to Slack thread → When tool needs approval, runner pauses and orchestrator posts Block Kit buttons → User clicks Approve/Deny → Orchestrator edits the button message in place (replacing buttons with decision text) and POSTs to runner `/jobs/{id}/approve` → Agent continues or stops. If no approval is given within 10 minutes, the runner auto-denies the tool call and posts an `approval_timeout` event.
+
+**Persistent sessions**: After completing a task, the agent session stays alive in `waiting_input` state. The user can send follow-up messages in the Slack thread, which are forwarded to the runner via `/jobs/{id}/message`. The agent processes the follow-up and returns to `waiting_input`. Only one active session is allowed at a time. To end a session, use `!poc exit` which POSTs to `/jobs/{id}/end`. Runner event types for persistent sessions: `assistant_response` (after each turn), `waiting_input` (ready for follow-up), `session_ended` (session terminated).
 
 ## Execution Boundary & Container Isolation
 - The runner (`src/poc/`) runs inside Docker. Start it with `docker compose up -d`.
@@ -104,7 +107,7 @@ Slack (Socket Mode)
   - `orchestrator_host/__init__.py`
   - `orchestrator_host/main.py` — Entry point, loads .env, starts callback server + Socket Mode
   - `orchestrator_host/slack_bot.py` — Slack Bolt app, `!poc` commands, Block Kit action handlers
-  - `orchestrator_host/docker_exec.py` — HTTP client to runner (start, approve, message, cancel)
+  - `orchestrator_host/docker_exec.py` — HTTP client to runner (start, approve, message, cancel, end)
   - `orchestrator_host/state.py` — JobState dataclass with agent fields, file I/O with locking
   - `orchestrator_host/jobs.py` — Job queue, dispatches start/cancel to runner via HTTP
   - `orchestrator_host/callback_server.py` — HTTP event receiver on port 8001
@@ -133,7 +136,7 @@ Slack (Socket Mode)
 ## Verifying Changes
 - **Always run unit tests before committing**:
   - `source .venv/bin/activate && python -m pytest tests/ -v`
-- All 163+ tests must pass.
+- All 185+ tests must pass.
 - Networked tests are skipped automatically when API keys are absent.
 - **If any runner code changed** (`src/poc/`, `Dockerfile.poc`, `docker-compose.yml`):
   - Rebuild and restart the container: `docker compose up -d --build`
@@ -187,13 +190,26 @@ Slack (Socket Mode)
      -d '{"goal": "What is 2+2? Report the answer.", "callback_url": ""}'
    ```
 
-4. Poll status until `"status": "completed"`:
+4. Poll status — agent will respond then enter `waiting_input`:
    ```bash
    curl -s http://localhost:8000/jobs/smoke-test/status
-   # {"job_id": "smoke-test", "status": "completed", "iteration": 2, ...}
+   # {"job_id": "smoke-test", "status": "waiting_input", "iteration": 2, ...}
    ```
    If `status` is `failed`, check `result_text` for the error and runner
    logs via `docker compose logs --tail 50`.
+
+   Send a follow-up message:
+   ```bash
+   curl -s -X POST http://localhost:8000/jobs/smoke-test/message \
+     -H "Content-Type: application/json" \
+     -d '{"message": "What is 3+3?"}'
+   ```
+
+   End the session:
+   ```bash
+   curl -s -X POST http://localhost:8000/jobs/smoke-test/end \
+     -H "Content-Type: application/json" -d '{}'
+   ```
 
 5. Test the approval flow — start a task that needs bash (requires approval):
    ```bash
@@ -229,18 +245,24 @@ Slack (Socket Mode)
    - Confirm the job was started
    - Post tool call progress (e.g., `:hourglass_flowing_sand: WebSearch: ...`)
    - Update tool calls on completion (`:white_check_mark: WebSearch: ...`)
-   - Complete with a summary message and cost
-7. For tasks that involve writes or bash commands, the bot will post approval
-   buttons. Click **Approve**, **Approve All**, or **Deny**, or reply in the
-   thread with "yes"/"no".
-   - After clicking a button, the original message is **edited in place** to
-     show the decision (e.g., `:white_check_mark: bash — Approved`) and the
-     buttons are removed. This prevents double-clicks and reduces thread clutter.
-   - Text replies ("yes"/"no") post a follow-up confirmation message instead.
-8. To test approval timeout: trigger an approval and don't respond for 10 min.
-   - The agent auto-denies the tool call.
-   - Slack thread posts: `:hourglass: tool — approval timed out after 600s, denied automatically`.
-   - The agent continues with a denial message in its conversation.
+   - Post the agent's response with turn count and cost
+   - Show `:white_circle: Ready for input` status
+7. Send a follow-up message in the thread (e.g., "What about New York?").
+   The agent will process it and return to waiting for input.
+8. Type `!poc exit` to end the session. The bot posts `:wave: Session ending...`
+9. Trying `!poc run` while a session is active will be rejected with a message
+   to `!poc exit` first.
+10. For tasks that involve writes or bash commands, the bot will post approval
+    buttons. Click **Approve**, **Approve All**, or **Deny**, or reply in the
+    thread with "yes"/"no".
+    - After clicking a button, the original message is **edited in place** to
+      show the decision (e.g., `:white_check_mark: bash — Approved`) and the
+      buttons are removed. This prevents double-clicks and reduces thread clutter.
+    - Text replies ("yes"/"no") post a follow-up confirmation message instead.
+11. To test approval timeout: trigger an approval and don't respond for 10 min.
+    - The agent auto-denies the tool call.
+    - Slack thread posts: `:hourglass: tool — approval timed out after 600s, denied automatically`.
+    - The agent continues with a denial message in its conversation.
 
 ## If blocked
 When blocked, ask only 1-3 concise multiple-choice questions to unblock.

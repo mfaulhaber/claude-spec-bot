@@ -78,6 +78,7 @@ def main() -> None:
     from orchestrator_host.callback_server import start_callback_server
     from orchestrator_host.progress import SlackProgressReporter
     from orchestrator_host.slack_bot import SlackCallback, create_slack_app
+    from orchestrator_host.state import load_state, save_state
 
     # Build queue with null callback (will be replaced after app creation)
     queue = JobQueue()
@@ -119,8 +120,17 @@ def main() -> None:
         if event_type == "approval_timeout":
             approval_manager.clear_job(job_id)
 
+        # Update job state for waiting_input
+        if event_type == "waiting_input":
+            try:
+                state = load_state(job_id)
+                state.set_phase("WAITING_INPUT")
+                save_state(state)
+            except Exception:
+                log.exception("Failed to update state for waiting_input: %s", job_id)
+
         # Mark job as completed in the queue
-        if event_type in ("completed", "failed"):
+        if event_type in ("completed", "failed", "session_ended"):
             queue.mark_completed(job_id)
 
     # Start callback server on port 8001

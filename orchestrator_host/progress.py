@@ -185,6 +185,26 @@ class SlackProgressReporter:
         )
         self._post(job, text)
 
+    def _on_assistant_response(self, job_id: str, job: dict, data: dict) -> None:
+        message = data.get("message", "")
+        num_turns = data.get("num_turns", "?")
+        total_cost = data.get("total_cost_usd")
+
+        text = f":speech_balloon: Agent responded (turn {num_turns})"
+        if message:
+            text += f"\n\n{message[:1500]}"
+        if total_cost is not None:
+            text += f"\n_Cost: ${total_cost:.4f}_"
+
+        self._post(job, text)
+
+    def _on_waiting_input(self, job_id: str, job: dict, data: dict) -> None:
+        self._update_status(job, ":white_circle: Ready for input")
+
+    def _on_session_ended(self, job_id: str, job: dict, data: dict) -> None:
+        self._post(job, ":wave: Session ended.")
+        job["status_ts"] = None
+
     def _on_token_usage(self, job_id: str, job: dict, data: dict) -> None:
         # Silently track, no Slack post needed
         pass

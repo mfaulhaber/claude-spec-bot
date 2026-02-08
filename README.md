@@ -138,6 +138,7 @@ Verify by typing `!poc help` in the channel — the bot should respond.
 | Command | Description |
 |---|---|
 | `!poc run [--model opus\|sonnet\|haiku] <task>` | Start the agent with a task |
+| `!poc exit` | End the current persistent session |
 | `!poc status [job_id]` | Show agent status (iteration, model, tokens) |
 | `!poc cancel [job_id]` | Cancel a running or queued job |
 | `!poc list` | List recent jobs |
@@ -145,16 +146,20 @@ Verify by typing `!poc help` in the channel — the bot should respond.
 
 Responses are posted in the Slack thread where the command was issued.
 
+**Persistent sessions:** After the agent responds, the session stays alive and waits for follow-up messages. Send any text in the thread to continue the conversation. Use `!poc exit` to end the session. Only one session can be active at a time — starting a new `!poc run` while a session is active will be rejected.
+
 **Tool approval:** The agent will request approval for bash commands and file writes. You can approve/deny via Block Kit buttons or by replying in the thread with "yes"/"approve" or "no"/"deny". After you click a button, the original message is edited in place to show the decision (buttons are removed). If no response is given within 10 minutes, the tool call is automatically denied.
 
 ### Job State Machine
 
 ```
-QUEUED -> RUNNING -> WAITING_APPROVAL -> RUNNING (resume) -> DONE
-             |                                    |
-          BLOCKED                             CANCELLED
-             |
-          CANCELLED
+QUEUED -> RUNNING -> WAITING_APPROVAL -> RUNNING (resume) -> WAITING_INPUT
+             |                                    |                |
+          BLOCKED                             CANCELLED    (follow-up msg)
+             |                                                     |
+          CANCELLED                                           RUNNING ...
+                                                                   |
+                                                              WAITING_INPUT -> DONE (!poc exit)
 
 RUNNING -> FAILED
 RUNNING -> CANCELLED
@@ -179,7 +184,7 @@ Per-job state is stored at `runner/jobs/<job_id>/state.json`.
 │   ├── __init__.py
 │   ├── main.py                 # Entry point, wires all components
 │   ├── slack_bot.py            # Slack Bolt app, !poc commands, Block Kit actions
-│   ├── docker_exec.py          # HTTP client to runner
+│   ├── docker_exec.py          # HTTP client to runner (start, approve, message, cancel, end)
 │   ├── state.py                # Job state dataclasses, file I/O
 │   ├── jobs.py                 # Single-concurrency job queue
 │   ├── callback_server.py      # HTTP server on :8001 for runner events
@@ -243,18 +248,31 @@ curl -s -X POST http://localhost:8000/jobs/smoke-test/start \
 # {"job_id": "smoke-test", "status": "started", "model": "claude-sonnet-4-5-20250929"}
 ```
 
-Poll until the status field reads `completed`:
+Poll until the status field reads `waiting_input` (session stays alive for follow-ups):
 
 ```bash
 curl -s http://localhost:8000/jobs/smoke-test/status | python -m json.tool
 # {
 #   "job_id": "smoke-test",
-#   "status": "completed",      <-- confirms the full loop worked
+#   "status": "waiting_input",   <-- confirms the full loop worked
 #   "iteration": 2,
-#   "max_iterations": 200,
+#   "max_turns": 200,
 #   "model": "claude-sonnet-4-5-20250929",
 #   "result_text": "Found 12 Python files..."
 # }
+```
+
+Send a follow-up message and then end the session:
+
+```bash
+# Follow-up
+curl -s -X POST http://localhost:8000/jobs/smoke-test/message \
+  -H "Content-Type: application/json" \
+  -d '{"message": "How many are test files?"}'
+
+# End session
+curl -s -X POST http://localhost:8000/jobs/smoke-test/end \
+  -H "Content-Type: application/json" -d '{}'
 ```
 
 If `status` is `failed`, check `result_text` for the error (usually an invalid
@@ -316,13 +334,17 @@ testing, the timeout is configurable via the `approval_timeout` field in
 3. Start the runner: `docker compose up -d --build`
 4. Start the orchestrator: `source .venv/bin/activate && python -m orchestrator_host.main`
 5. In Slack, send: `!poc run List all Python files in the project`
-6. Watch the thread for progress messages and the final result
-7. To test the approval flow: `!poc run Add a hello world test file`
-   - The agent will request approval for `write_file` — click **Approve** or reply "yes" in the thread
-   - After clicking, the button message is edited in place to show `:white_check_mark: write_file — Approved` (buttons are removed)
-   - Click **Approve All** to auto-approve all future calls to that tool
-   - Click **Deny** to reject — the agent receives a denial and continues without executing
-8. To test approval timeout: trigger an approval and don't respond
-   - After 10 minutes the tool is automatically denied
-   - The thread posts `:hourglass: tool — approval timed out after 600s, denied automatically`
-   - The agent continues with a denial message
+6. Watch the thread for progress messages and the agent's response
+7. Send a follow-up message in the thread (e.g., "Which are test files?")
+   - The agent processes it and returns to waiting for input
+8. Type `!poc exit` to end the session
+9. Try `!poc run` while a session is active — it will be rejected
+10. To test the approval flow: `!poc run Add a hello world test file`
+    - The agent will request approval for `write_file` — click **Approve** or reply "yes" in the thread
+    - After clicking, the button message is edited in place to show `:white_check_mark: write_file — Approved` (buttons are removed)
+    - Click **Approve All** to auto-approve all future calls to that tool
+    - Click **Deny** to reject — the agent receives a denial and continues without executing
+11. To test approval timeout: trigger an approval and don't respond
+    - After 10 minutes the tool is automatically denied
+    - The thread posts `:hourglass: tool — approval timed out after 600s, denied automatically`
+    - The agent continues with a denial message

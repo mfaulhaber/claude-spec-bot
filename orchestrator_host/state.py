@@ -26,7 +26,8 @@ def generate_job_id() -> str:
 # --- Data model ---
 
 VALID_PHASES = (
-    "QUEUED", "RUNNING", "WAITING_APPROVAL", "BLOCKED", "DONE", "FAILED", "CANCELLED"
+    "QUEUED", "RUNNING", "WAITING_APPROVAL", "WAITING_INPUT", "BLOCKED",
+    "DONE", "FAILED", "CANCELLED",
 )
 
 

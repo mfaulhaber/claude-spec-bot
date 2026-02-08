@@ -7,6 +7,7 @@ Provides endpoints for managing agent sessions:
     POST /jobs/{job_id}/approve   Approve/deny a pending tool call
     POST /jobs/{job_id}/message   Send a follow-up message to the agent
     POST /jobs/{job_id}/cancel    Cancel a running session
+    POST /jobs/{job_id}/end       Gracefully end a persistent session
     GET  /jobs/{job_id}/status    Get session status
 """
 
@@ -29,6 +30,7 @@ _ROUTE_JOB_START = re.compile(r"^/jobs/(?P<job_id>[^/]+)/start$")
 _ROUTE_JOB_APPROVE = re.compile(r"^/jobs/(?P<job_id>[^/]+)/approve$")
 _ROUTE_JOB_MESSAGE = re.compile(r"^/jobs/(?P<job_id>[^/]+)/message$")
 _ROUTE_JOB_CANCEL = re.compile(r"^/jobs/(?P<job_id>[^/]+)/cancel$")
+_ROUTE_JOB_END = re.compile(r"^/jobs/(?P<job_id>[^/]+)/end$")
 _ROUTE_JOB_STATUS = re.compile(r"^/jobs/(?P<job_id>[^/]+)/status$")
 
 
@@ -82,6 +84,12 @@ class RunnerHandler(BaseHTTPRequestHandler):
             self._handle_cancel(m.group("job_id"), body)
             return
 
+        # POST /jobs/{job_id}/end
+        m = _ROUTE_JOB_END.match(path)
+        if m:
+            self._handle_end(m.group("job_id"), body)
+            return
+
         self._respond(404, {"error": "Not found"})
 
     # ------------------------------------------------------------------
@@ -91,7 +99,7 @@ class RunnerHandler(BaseHTTPRequestHandler):
     def _handle_start(self, job_id: str, body: dict) -> None:
         if job_id in self.sessions:
             session = self.sessions[job_id]
-            if session.status in ("running", "waiting_approval"):
+            if session.status in ("running", "waiting_approval", "waiting_input"):
                 self._respond(409, {"error": f"Job {job_id} is already running"})
                 return
 
@@ -160,6 +168,15 @@ class RunnerHandler(BaseHTTPRequestHandler):
 
         session.cancel()
         self._respond(200, {"status": "cancel_requested"})
+
+    def _handle_end(self, job_id: str, body: dict) -> None:
+        session = self.sessions.get(job_id)
+        if not session:
+            self._respond(404, {"error": f"Job {job_id} not found"})
+            return
+
+        session.end()
+        self._respond(200, {"status": "end_requested"})
 
     def _handle_status(self, job_id: str) -> None:
         session = self.sessions.get(job_id)

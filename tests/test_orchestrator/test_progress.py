@@ -131,6 +131,58 @@ class TestSlackProgressReporter:
         assert "bash" in text
         assert "600" in text
 
+    def test_assistant_response_posts_message(self):
+        reporter, client = self._make_reporter()
+        reporter.handle_event({
+            "job_id": "job-1",
+            "event_type": "assistant_response",
+            "data": {
+                "message": "Here is the answer.",
+                "num_turns": 3,
+                "total_cost_usd": 0.0123,
+            },
+        })
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args[1]["text"]
+        assert "Agent responded" in text
+        assert "3" in text
+        assert "Here is the answer." in text
+        assert "$0.0123" in text
+
+    def test_waiting_input_updates_status(self):
+        reporter, client = self._make_reporter()
+        reporter.handle_event({
+            "job_id": "job-1",
+            "event_type": "waiting_input",
+            "data": {},
+        })
+        # Should post a new status message (no prior status_ts)
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args[1]["text"]
+        assert "Ready for input" in text
+
+    def test_session_ended_posts_message(self):
+        reporter, client = self._make_reporter()
+        reporter.handle_event({
+            "job_id": "job-1",
+            "event_type": "session_ended",
+            "data": {"message": "Session ended by user"},
+        })
+        client.chat_postMessage.assert_called_once()
+        text = client.chat_postMessage.call_args[1]["text"]
+        assert "Session ended" in text
+
+    def test_session_ended_clears_status_ts(self):
+        reporter, client = self._make_reporter()
+        job = reporter._jobs["job-1"]
+        job["status_ts"] = "some-ts"
+        reporter.handle_event({
+            "job_id": "job-1",
+            "event_type": "session_ended",
+            "data": {},
+        })
+        assert job["status_ts"] is None
+
     def test_unknown_job_ignored(self):
         reporter, client = self._make_reporter()
         reporter.handle_event({

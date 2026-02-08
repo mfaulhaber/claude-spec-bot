@@ -26,6 +26,9 @@ class TestParseCommand:
     def test_cancel(self):
         assert parse_command("!poc cancel abc-123") == ("cancel", "abc-123")
 
+    def test_exit(self):
+        assert parse_command("!poc exit") == ("exit", "")
+
     def test_help(self):
         assert parse_command("!poc help") == ("help", "")
 
@@ -134,6 +137,16 @@ class TestFormatJobStatus:
         )
         text = format_job_status(state)
         assert "WAITING_APPROVAL" in text
+
+    def test_waiting_input(self):
+        state = JobState(
+            job_id="test-7",
+            goal="Input",
+            phase="WAITING_INPUT",
+        )
+        text = format_job_status(state)
+        assert "WAITING_INPUT" in text
+        assert ":white_circle:" in text
 
 
 class TestSlackCallback:

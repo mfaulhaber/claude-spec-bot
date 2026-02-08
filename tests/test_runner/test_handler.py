@@ -201,3 +201,49 @@ class TestMessageEndpoint:
         assert data["status"] == "message_added"
         mock_session.add_message.assert_called_once_with("do something else")
         server.server_close()
+
+
+class TestEndEndpoint:
+    def test_end(self):
+        mock_session = MagicMock()
+
+        RunnerHandler.sessions = {"test-1": mock_session}
+        server = HTTPServer(("127.0.0.1", 0), RunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+
+        body = json.dumps({}).encode()
+        req = Request(
+            f"http://127.0.0.1:{port}/jobs/test-1/end",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read())
+
+        assert data["status"] == "end_requested"
+        mock_session.end.assert_called_once()
+        server.server_close()
+
+    def test_end_not_found(self):
+        RunnerHandler.sessions = {}
+        server = HTTPServer(("127.0.0.1", 0), RunnerHandler)
+        port = server.server_address[1]
+        thread = Thread(target=server.handle_request, daemon=True)
+        thread.start()
+
+        body = json.dumps({}).encode()
+        req = Request(
+            f"http://127.0.0.1:{port}/jobs/nope/end",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urlopen(req)
+            assert False, "Should have raised"
+        except Exception as e:
+            assert "404" in str(e)
+        server.server_close()

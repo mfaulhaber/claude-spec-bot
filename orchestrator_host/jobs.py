@@ -12,7 +12,7 @@ import threading
 from collections import deque
 from typing import Protocol
 
-from orchestrator_host.docker_exec import cancel_agent_job, start_agent_job
+from orchestrator_host.docker_exec import cancel_agent_job, end_agent_job, start_agent_job
 from orchestrator_host.state import (
     JobState,
     list_jobs,
@@ -63,6 +63,10 @@ class JobQueue:
     def current_job_id(self) -> str | None:
         return self._current_job_id
 
+    def has_active_session(self) -> bool:
+        """Return True if there is a running job or queued jobs."""
+        return self._current_job_id is not None or len(self._queue) > 0
+
     def enqueue(self, job_id: str) -> int:
         """Add a job to the queue. Returns queue position (0 = running next)."""
         with self._lock:
@@ -94,6 +98,21 @@ class JobQueue:
                 self._start_next()
                 return True
         return False
+
+    def end_session(self, job_id: str) -> None:
+        """Gracefully end a persistent agent session."""
+        with self._lock:
+            end_agent_job(job_id)
+            try:
+                state = load_state(job_id)
+                state.set_phase("DONE")
+                save_state(state)
+                self.callback.on_job_done(state)
+            except Exception:
+                log.exception("Error ending session for job %s", job_id)
+            if self._current_job_id == job_id:
+                self._current_job_id = None
+                self._start_next()
 
     def mark_completed(self, job_id: str) -> None:
         """Called by the callback server when the runner reports completion."""
@@ -166,12 +185,12 @@ class JobQueue:
 
 
 def recover_stale_jobs() -> list[str]:
-    """On startup, mark any RUNNING or WAITING_APPROVAL jobs as FAILED."""
+    """On startup, mark any RUNNING, WAITING_APPROVAL, or WAITING_INPUT jobs as FAILED."""
     recovered = []
     for job_id in list_jobs():
         try:
             state = load_state(job_id)
-            if state.phase in ("RUNNING", "WAITING_APPROVAL"):
+            if state.phase in ("RUNNING", "WAITING_APPROVAL", "WAITING_INPUT"):
                 log.warning("Recovering stale %s job %s -> FAILED", state.phase, job_id)
                 state.set_phase("FAILED")
                 state.error = "Orchestrator restarted while job was running"
